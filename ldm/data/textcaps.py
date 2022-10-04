@@ -8,8 +8,6 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-
-
 class TextCapsBase(Dataset):
     def __init__(self,
                  data_root,
@@ -62,7 +60,7 @@ class TextCapsBase(Dataset):
 
         if not image.mode == "RGB":
             image = image.convert("RGB")
-            
+
         example["caption"] = caption_str
 
         # default to score-sde preprocessing

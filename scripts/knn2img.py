@@ -364,7 +364,7 @@ if __name__ == "__main__":
                     if isinstance(prompts, tuple):
                         prompts = list(prompts)
                     shape = [16, opt.H // 16, opt.W // 16]  # note: currently hardcoded for f16 model
-                    samples_ddim, _ = sampler.sample(S=opt.ddim_steps,
+                    samples_ddim, _ = sampler.sample(num_steps=opt.ddim_steps,
                                                      conditioning=c,
                                                      batch_size=c.shape[0],
                                                      shape=shape,

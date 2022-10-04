@@ -66,7 +66,12 @@ def make_ddim_sampling_parameters(alphacums, ddim_timesteps, eta, verbose=True):
     alphas_prev = np.asarray([alphacums[0]] + alphacums[ddim_timesteps[:-1]].tolist())
 
     # according the the formula provided in https://arxiv.org/abs/2010.02502
-    sigmas = eta * np.sqrt((1 - alphas_prev) / (1 - alphas) * (1 - alphas / alphas_prev))
+    if eta == 0:
+        # other branch causes nans in bfloat16 case
+        sigmas = np.zeros_like(alphas)
+    else:
+        sigmas = eta * np.sqrt((1 - alphas_prev) / (1 - alphas) * (1 - alphas / alphas_prev))
+
     if verbose:
         print(f'Selected alphas for ddim sampler: a_t: {alphas}; a_(t-1): {alphas_prev}')
         print(f'For the chosen value of eta, which is {eta}, '
@@ -148,7 +153,7 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + input_grads
 
 
-def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
+def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False, dtype=torch.float32):
     """
     Create sinusoidal timestep embeddings.
     :param timesteps: a 1-D Tensor of N indices, one per batch element.
@@ -161,8 +166,8 @@ def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=timesteps.device)
-        args = timesteps[:, None].float() * freqs[None]
+        ).to(dtype=dtype, device=timesteps.device)
+        args = timesteps[:, None].to(dtype) * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
@@ -213,7 +218,10 @@ class SiLU(nn.Module):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
+        # TODO: make training script support mixed precision with fp32 GroupNorm
+        # You probably need to modify something in deepspeed (?)
+        # return super().forward(x.float()).type(x.dtype)
+        return super().forward(x)
 
 def conv_nd(dims, *args, **kwargs):
     """
@@ -261,7 +269,7 @@ class HybridConditioner(nn.Module):
         return {'c_concat': [c_concat], 'c_crossattn': [c_crossattn]}
 
 
-def noise_like(shape, device, repeat=False):
-    repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device).repeat(shape[0], *((1,) * (len(shape) - 1)))
-    noise = lambda: torch.randn(shape, device=device)
+def noise_like(shape, device, dtype=torch.float32, repeat=False):
+    repeat_noise = lambda: torch.randn((1, *shape[1:]), device=device, dtype=dtype).repeat(shape[0], *((1,) * (len(shape) - 1)))
+    noise = lambda: torch.randn(shape, device=device, dtype=dtype)
     return repeat_noise() if repeat else noise()

@@ -4,6 +4,7 @@ import time
 import torch
 import torchvision
 import pytorch_lightning as pl
+import wandb
 
 from packaging import version
 from omegaconf import OmegaConf
@@ -268,8 +269,8 @@ class SetupCallback(Callback):
 
     def on_keyboard_interrupt(self, trainer, pl_module):
         if trainer.global_rank == 0:
-            print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
+            print(f"Saving a checkpoint to {ckpt_path}")
             trainer.save_checkpoint(ckpt_path)
 
     def on_pretrain_routine_start(self, trainer, pl_module):
@@ -384,6 +385,10 @@ class ImageLogger(Callback):
 
             # logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
             # logger_log_images(pl_module, images, pl_module.global_step, split)
+
+            if wandb.run is not None:
+                wandb.log({f"{split}/{k}": [wandb.Image(img) for img in images[k]]},
+                          step=pl_module.global_step)
 
             if is_train:
                 pl_module.train()
@@ -524,6 +529,8 @@ if __name__ == "__main__":
         nowname = now + name + opt.postfix
         logdir = os.path.join(opt.logdir, nowname)
 
+    print(f"Logging to {logdir}")
+
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed)
@@ -571,6 +578,7 @@ if __name__ == "__main__":
                 "project": "stable_diffusion",
                 "save_dir": logdir,
                 "offline": opt.debug,
+                "config": dict(config),
             }
         }
 
@@ -674,7 +682,7 @@ if __name__ == "__main__":
         trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
         trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
-        trainer.logdir = logdir  ###
+        trainer.logdir = logdir
 
         # data
         data = instantiate_from_config(config.data)
@@ -713,8 +721,8 @@ if __name__ == "__main__":
         def melk(*args, **kwargs):
             # run all checkpoint hooks
             if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
                 ckpt_path = os.path.join(ckptdir, "last.ckpt")
+                print(f"Saving a checkpoint to {ckpt_path}")
                 trainer.save_checkpoint(ckpt_path)
 
         def divein(*args, **kwargs):

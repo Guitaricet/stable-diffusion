@@ -1,25 +1,14 @@
-# Stable Diffusion
-*Stable Diffusion was made possible thanks to a collaboration with [Stability AI](https://stability.ai/) and [Runway](https://runwayml.com/) and builds upon our previous work:*
+# Simplifying Stable Diffusion
 
-[**High-Resolution Image Synthesis with Latent Diffusion Models**](https://ommer-lab.com/research/latent-diffusion-models/)<br/>
-[Robin Rombach](https://github.com/rromb)\*,
-[Andreas Blattmann](https://github.com/ablattmann)\*,
-[Dominik Lorenz](https://github.com/qp-qp)\,
-[Patrick Esser](https://github.com/pesser),
-[Björn Ommer](https://hci.iwr.uni-heidelberg.de/Staff/bommer)<br/>
-_[CVPR '22 Oral](https://openaccess.thecvf.com/content/CVPR2022/html/Rombach_High-Resolution_Image_Synthesis_With_Latent_Diffusion_Models_CVPR_2022_paper.html) |
-[GitHub](https://github.com/CompVis/latent-diffusion) | [arXiv](https://arxiv.org/abs/2112.10752) | [Project page](https://ommer-lab.com/research/latent-diffusion-models/)_
+This fork is aimed to simplify Stable Diffusion repository to allow for easier experimentation with the model, such that fine-tuning, architecture modifications, and improving speed and memory requirements of the model.
 
-![txt2img-stable2](assets/stable-samples/txt2img/merged-0006.png)
-[Stable Diffusion](#stable-diffusion-v1) is a latent text-to-image diffusion
-model.
-Thanks to a generous compute donation from [Stability AI](https://stability.ai/) and support from [LAION](https://laion.ai/), we were able to train a Latent Diffusion Model on 512x512 images from a subset of the [LAION-5B](https://laion.ai/blog/laion-5b/) database. 
-Similar to Google's [Imagen](https://arxiv.org/abs/2205.11487), 
-this model uses a frozen CLIP ViT-L/14 text encoder to condition the model on text prompts.
-With its 860M UNet and 123M text encoder, the model is relatively lightweight and runs on a GPU with at least 10GB VRAM.
-See [this section](#stable-diffusion-v1) below and the [model card](https://huggingface.co/CompVis/stable-diffusion).
+> Original Stable Diffusion repository: https://github.com/CompVis/stable-diffusion
 
-  
+## Features:
+
+* bf16 – a lot of minior modifications and fp32 conversions for the operations that don't support bf16 (`interpolate`)
+* Deepspeed - new training loop (`main_nolightning`) that is easy to read and modify
+
 ## Requirements
 A suitable [conda](https://conda.io/) environment named `ldm` can be created
 and activated with:
@@ -29,33 +18,10 @@ conda env create -f environment.yaml
 conda activate ldm
 ```
 
-You can also update an existing [latent diffusion](https://github.com/CompVis/latent-diffusion) environment by running
-
-```
-conda install pytorch torchvision -c pytorch
-pip install transformers==4.19.2 diffusers invisible-watermark
-pip install -e .
-``` 
-
-
-## Stable Diffusion v1
-
-Stable Diffusion v1 refers to a specific configuration of the model
-architecture that uses a downsampling-factor 8 autoencoder with an 860M UNet
-and CLIP ViT-L/14 text encoder for the diffusion model. The model was pretrained on 256x256 images and 
-then finetuned on 512x512 images.
-
-*Note: Stable Diffusion v1 is a general text-to-image diffusion model and therefore mirrors biases and (mis-)conceptions that are present
-in its training data. 
-Details on the training procedure and data, as well as the intended use of the model can be found in the corresponding [model card](Stable_Diffusion_v1_Model_Card.md).*
-
-The weights are available via [the CompVis organization at Hugging Face](https://huggingface.co/CompVis) under [a license which contains specific use-based restrictions to prevent misuse and harm as informed by the model card, but otherwise remains permissive](LICENSE). While commercial use is permitted under the terms of the license, **we do not recommend using the provided weights for services or products without additional safety mechanisms and considerations**, since there are [known limitations and biases](Stable_Diffusion_v1_Model_Card.md#limitations-and-bias) of the weights, and research on safe and ethical deployment of general text-to-image models is an ongoing effort. **The weights are research artifacts and should be treated as such.**
-
-[The CreativeML OpenRAIL M license](LICENSE) is an [Open RAIL M license](https://www.licenses.ai/blog/2022/8/18/naming-convention-of-responsible-ai-licenses), adapted from the work that [BigScience](https://bigscience.huggingface.co/) and [the RAIL Initiative](https://www.licenses.ai/) are jointly carrying in the area of responsible AI licensing. See also [the article about the BLOOM Open RAIL license](https://bigscience.huggingface.co/blog/the-bigscience-rail-license) on which our license is based.
-
 ### Weights
 
-We currently provide the following checkpoints:
+
+Stable Diffusion currently provide the following checkpoints:
 
 - `sd-v1-1.ckpt`: 237k steps at resolution `256x256` on [laion2B-en](https://huggingface.co/datasets/laion/laion2B-en).
   194k steps at resolution `512x512` on [laion-high-resolution](https://huggingface.co/datasets/laion/laion-high-resolution) (170M examples from LAION-5B with resolution `>= 1024x1024`).
@@ -69,7 +35,6 @@ Evaluations with different classifier-free guidance scales (1.5, 2.0, 3.0, 4.0,
 5.0, 6.0, 7.0, 8.0) and 50 PLMS sampling
 steps show the relative improvements of the checkpoints:
 ![sd evaluation results](assets/v1-variants-scores.jpg)
-
 
 
 ### Text-to-Image with Stable Diffusion
@@ -144,55 +109,9 @@ non-EMA to EMA weights. If you want to examine the effect of EMA vs no EMA, we p
 which contain both types of weights. For these, `use_ema=False` will load and use the non-EMA weights.
 
 
-#### Diffusers Integration
-
-A simple way to download and sample Stable Diffusion is by using the [diffusers library](https://github.com/huggingface/diffusers/tree/main#new--stable-diffusion-is-now-fully-compatible-with-diffusers):
-```py
-# make sure you're logged in with `huggingface-cli login`
-from torch import autocast
-from diffusers import StableDiffusionPipeline
-
-pipe = StableDiffusionPipeline.from_pretrained(
-	"CompVis/stable-diffusion-v1-4", 
-	use_auth_token=True
-).to("cuda")
-
-prompt = "a photo of an astronaut riding a horse on mars"
-with autocast("cuda"):
-    image = pipe(prompt)["sample"][0]  
-    
-image.save("astronaut_rides_horse.png")
-```
-
-
-### Image Modification with Stable Diffusion
-
-By using a diffusion-denoising mechanism as first proposed by [SDEdit](https://arxiv.org/abs/2108.01073), the model can be used for different 
-tasks such as text-guided image-to-image translation and upscaling. Similar to the txt2img sampling script, 
-we provide a script to perform image modification with Stable Diffusion.  
-
-The following describes an example where a rough sketch made in [Pinta](https://www.pinta-project.com/) is converted into a detailed artwork.
-```
-python scripts/img2img.py --prompt "A fantasy landscape, trending on artstation" --init-img <path-to-img.jpg> --strength 0.8
-```
-Here, strength is a value between 0.0 and 1.0, that controls the amount of noise that is added to the input image. 
-Values that approach 1.0 allow for lots of variations but will also produce images that are not semantically consistent with the input. See the following example.
-
-**Input**
-
-![sketch-in](assets/stable-samples/img2img/sketch-mountains-input.jpg)
-
-**Outputs**
-
-![out3](assets/stable-samples/img2img/mountains-3.png)
-![out2](assets/stable-samples/img2img/mountains-2.png)
-
-This procedure can, for example, also be used to upscale samples from the base model.
-
-
 ## Comments 
 
-- Our codebase for the diffusion models builds heavily on [OpenAI's ADM codebase](https://github.com/openai/guided-diffusion)
+- Stable Diffusion codebase for the diffusion models builds heavily on [OpenAI's ADM codebase](https://github.com/openai/guided-diffusion)
 and [https://github.com/lucidrains/denoising-diffusion-pytorch](https://github.com/lucidrains/denoising-diffusion-pytorch). 
 Thanks for open-sourcing!
 
@@ -211,5 +130,3 @@ Thanks for open-sourcing!
       primaryClass={cs.CV}
 }
 ```
-
-

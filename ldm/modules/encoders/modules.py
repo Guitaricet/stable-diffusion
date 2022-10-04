@@ -152,8 +152,11 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     def forward(self, text):
         batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
                                         return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
-        tokens = batch_encoding["input_ids"].to(self.device)
-        outputs = self.transformer(input_ids=tokens)
+        batch_encoding = batch_encoding.to(self.device)
+        input_ids = batch_encoding["input_ids"]
+
+        # attention mask was not used in stable-diffusion and enabling it for inference breaks it
+        outputs = self.transformer(input_ids=input_ids)
 
         z = outputs.last_hidden_state
         return z
@@ -202,11 +205,11 @@ class FrozenClipImageEmbedder(nn.Module):
             self,
             model,
             jit=False,
-            device='cuda' if torch.cuda.is_available() else 'cpu',
             antialias=False,
         ):
+        # NOTE: removed hard-coded cuda device
         super().__init__()
-        self.model, _ = clip.load(name=model, device=device, jit=jit)
+        self.model, _ = clip.load(name=model, jit=jit)
 
         self.antialias = antialias
 

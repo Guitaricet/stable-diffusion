@@ -32,7 +32,7 @@ def get_timestep_embedding(timesteps, embedding_dim):
 
 def nonlinearity(x):
     # swish
-    return x*torch.sigmoid(x)
+    return x * torch.sigmoid(x)
 
 
 def Normalize(in_channels, num_groups=32):
@@ -51,7 +51,11 @@ class Upsample(nn.Module):
                                         padding=1)
 
     def forward(self, x):
+        is_bf16 = x.dtype is torch.bfloat16
+        if is_bf16: x = x.to(torch.float32)
         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        if is_bf16: x = x.to(torch.bfloat16)
+
         if self.with_conv:
             x = self.conv(x)
         return x
@@ -681,7 +685,11 @@ class LatentRescaler(nn.Module):
         x = self.conv_in(x)
         for block in self.res_block1:
             x = block(x, None)
+        is_bf16 = x.dtype is torch.bfloat16
+        if is_bf16: x = x.to(torch.float32)
         x = torch.nn.functional.interpolate(x, size=(int(round(x.shape[2]*self.factor)), int(round(x.shape[3]*self.factor))))
+        if is_bf16: x = x.to(torch.bfloat16)
+
         x = self.attn(x)
         for block in self.res_block2:
             x = block(x, None)
@@ -764,7 +772,11 @@ class Resize(nn.Module):
         if scale_factor==1.0:
             return x
         else:
+            is_bf16 = x.dtype is torch.bfloat16
+            if is_bf16: x = x.to(torch.float32)
             x = torch.nn.functional.interpolate(x, mode=self.mode, align_corners=False, scale_factor=scale_factor)
+            if is_bf16: x = x.to(torch.bfloat16)
+
         return x
 
 class FirstStagePostProcessor(nn.Module):

@@ -113,7 +113,15 @@ class Upsample(nn.Module):
                 x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
             )
         else:
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
+            if x.dtype is th.bfloat16:
+                # interpolate is not supported for bf16
+                # so we upcast the operation to fp32 and then downcast the result back to bf16
+                x = x.to(th.float32)
+                x = F.interpolate(x, scale_factor=2, mode="nearest")
+                x = x.to(th.bfloat16)
+            else:
+                x = F.interpolate(x, scale_factor=2, mode="nearest")
+
         if self.use_conv:
             x = self.conv(x)
         return x
@@ -497,7 +505,6 @@ class UNetModel(nn.Module):
         self.conv_resample = conv_resample
         self.num_classes = num_classes
         self.use_checkpoint = use_checkpoint
-        self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
@@ -720,14 +727,14 @@ class UNetModel(nn.Module):
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
         hs = []
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False, dtype=x.dtype)
         emb = self.time_embed(t_emb)
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
+        h = x
         for module in self.input_blocks:
             h = module(h, emb, context)
             hs.append(h)
@@ -786,7 +793,6 @@ class EncoderUNetModel(nn.Module):
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.use_checkpoint = use_checkpoint
-        self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
@@ -942,10 +948,10 @@ class EncoderUNetModel(nn.Module):
         :param timesteps: a 1-D batch of timesteps.
         :return: an [N x K] Tensor of outputs.
         """
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels, dtype=x.dtype))
 
         results = []
-        h = x.type(self.dtype)
+        h = x
         for module in self.input_blocks:
             h = module(h, emb)
             if self.pool.startswith("spatial"):
