@@ -24,6 +24,8 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.encoders.modules import FrozenCLIPEmbedder
+from ldm.modules.encoders.hug_models import FrozenHugEmbedderWithAdapter
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -75,7 +77,6 @@ class DDPM(pl.LightningModule):
         super().__init__()
         assert parameterization in ["eps", "x0"], 'currently only supporting "eps" and "x0"'
         self.parameterization = parameterization
-        print(f"{self.__class__.__name__}: Running in {self.parameterization}-prediction mode")
         self.cond_stage_model = None
         self.clip_denoised = clip_denoised
         self.log_every_t = log_every_t
@@ -86,7 +87,6 @@ class DDPM(pl.LightningModule):
         self.model = DiffusionWrapper(unet_config, conditioning_key)
         self.data_dtype = torch.float32  # used for converting inputs to correct data type
 
-        count_params(self.model, verbose=True)
         self.use_ema = use_ema
         if self.use_ema:
             self.model_ema = LitEma(self.model)
@@ -201,9 +201,9 @@ class DDPM(pl.LightningModule):
             sd, strict=False)
         print(f"Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
         if len(missing) > 0:
-            print(f"Missing Keys: {missing}")
+            print(f"Missing Keys: {missing[:5]} ...")
         if len(unexpected) > 0:
-            print(f"Unexpected Keys: {unexpected}")
+            print(f"Unexpected Keys: {unexpected[:5]} ...")
 
     def q_mean_variance(self, x_start, t):
         """
@@ -520,13 +520,13 @@ class LatentDiffusion(DDPM):
             elif config == "__is_unconditional__":
                 print(f"Training {self.__class__.__name__} as an unconditional model.")
                 self.cond_stage_model = None
-                # self.be_unconditional = True
             else:
                 model = instantiate_from_config(config)
                 self.cond_stage_model = model.eval()
                 self.cond_stage_model.train = disabled_train
                 for param in self.cond_stage_model.parameters():
-                    param.requires_grad = False
+                    param.requires_grad = True
+
         else:
             assert config != '__is_first_stage__'
             assert config != '__is_unconditional__'
@@ -553,19 +553,26 @@ class LatentDiffusion(DDPM):
         else:
             raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
         return self.scale_factor * z
+    
+    def get_unconditional_conditioning(self, num_conditionings, seq_len=None):
+        if isinstance(self.cond_stage_model, FrozenCLIPEmbedder):
+            return self.cond_stage_model(num_conditionings * [""])
 
-    def get_learned_conditioning(self, c):
+        assert isinstance(self.cond_stage_model, FrozenHugEmbedderWithAdapter)
+        return self.cond_stage_model.get_blank_conditioning(num_conditionings, seq_len)
+
+    def get_learned_conditioning(self, conditioning):
         if self.cond_stage_forward is None:
             if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
-                c = self.cond_stage_model.encode(c)
-                if isinstance(c, DiagonalGaussianDistribution):
-                    c = c.mode()
+                conditioning = self.cond_stage_model.encode(conditioning)
+                if isinstance(conditioning, DiagonalGaussianDistribution):
+                    conditioning = conditioning.mode()
             else:
-                c = self.cond_stage_model(c)
+                conditioning = self.cond_stage_model(conditioning)
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
-            c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
-        return c
+            conditioning = getattr(self.cond_stage_model, self.cond_stage_forward)(conditioning)
+        return conditioning
 
     def meshgrid(self, h, w):
         y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
@@ -681,7 +688,6 @@ class LatentDiffusion(DDPM):
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
                 if isinstance(xc, dict) or isinstance(xc, list):
-                    # import pudb; pudb.set_trace()
                     c = self.get_learned_conditioning(xc)
                 else:
                     c = self.get_learned_conditioning(xc.to(self.device))

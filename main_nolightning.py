@@ -1,13 +1,13 @@
 """
 deepspeed main_nolightning.py \
-    --base configs/stable-diffusion/v1-finetune-textcaps.yaml \
+    --base configs/stable-diffusion/v1-finetune-textcaps-opt.yaml \
     --actual_resume checkpoints/stable-diffusion-v-1-4-original/sd-v1-4.ckpt \
     --max_epochs 1 \
-    --eval_every 10
+    --eval_every 10 \
+    --train_only_adapters \
 """
 
-import argparse, os, datetime
-from operator import pos
+import argparse, os, datetime, time
 from typing import Union
 
 from pprint import pformat
@@ -21,12 +21,11 @@ import deepspeed
 import torch.distributed as dist
 import torch.utils.data.distributed
 
-from torch.utils.data import random_split, DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
-from PIL import Image
 
 from pytorch_lightning import seed_everything
-from einops import rearrange
+from einops import rearrange, repeat
 
 from loguru import logger
 from tqdm import tqdm
@@ -63,6 +62,7 @@ def parse_args(**parser_kwargs):
     # Training arguments
     parser.add_argument("--max_epochs", type=int, default=1)
     parser.add_argument("--actual_resume", type=str, default="", help="Path to model to actually resume from")
+    parser.add_argument("--train_only_adapters", action="store_true", default=False, help="Only train FFN between text model and diffusion model")
 
     # Evaluation arguments
     parser.add_argument("--eval_every", type=int, default=1000, help="evaluate every n steps")
@@ -87,10 +87,12 @@ def load_model_from_config(config, ckpt, verbose=False):
     m, u = model.load_state_dict(sd, strict=False)
     if len(m) > 0 and verbose:
         logger.info("missing keys:")
-        logger.info(m)
+        logger.info(m[:3])
+        logger.info(f"and {len(m) - 3} more")
     if len(u) > 0 and verbose:
         logger.info("unexpected keys:")
-        logger.info(u)
+        logger.info(u[:3])
+        logger.info(f"and {len(u) - 3} more")
 
     return model
 
@@ -104,6 +106,26 @@ def postprocess_image(image):
     image = (image + 1.0) / 2.0
     image = (255.0 * image).clip(0, 255).astype(np.uint8)
     return image
+
+
+def gather_tensor(x: torch.Tensor):
+    gather_list = None
+    if dist.rank() == 0:
+        gather_list = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+    dist.gather(x, gather_list=gather_list, dst=0)
+
+    if dist.rank() == 0:
+        return torch.cat(gather_list, dim=0)
+
+def gather_object(x):
+    gather_list = None
+    if dist.rank() == 0:
+        gather_list = [None for _ in range(dist.get_world_size())]
+    dist.gather_object(x, gather_list=gather_list, dst=0)
+
+    if dist.rank() == 0:
+        gather_list = [item for sublist in gather_list for item in sublist]
+        return gather_list
 
 
 if __name__ == "__main__":
@@ -140,9 +162,19 @@ if __name__ == "__main__":
     else:
         model = instantiate_from_config(config.model)
 
+    if args.train_only_adapters:
+        trainable_parameters = [p for n, p in model.named_parameters() if "adapter" in n or "blank_conditioning" in n]
+    else:
+        trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+
+    logger.info(f"Number of model parameters    : {sum(p.numel() for p in model.parameters()) // 1e6}M")
+    logger.info(f"Number of trainable parameters: {sum(p.numel() for p in trainable_parameters) // 1e6}M")
+    optimizer = torch.optim.Adam(trainable_parameters, lr=config.deepspeed.optimizer.params.lr)
+
     model, optimizer, _, _ = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
+        optimizer=optimizer,
         config=deepspeed_config,
     )
     model: Union[LatentDiffusion, deepspeed.DeepSpeedEngine]  # helps with type hinting
@@ -166,18 +198,10 @@ if __name__ == "__main__":
         for config_path in args.base:
             wandb.save(config_path, policy="now")
 
-    train_dataset = ldm.data.textcaps.TextCapsBase(
-        data_root=config.data.params.train.params.data_root,
-        size=config.data.params.train.params.size,
-        set="train",
-    )
-    val_dataset = ldm.data.textcaps.TextCapsBase(
-        data_root=config.data.params.val.params.data_root,
-        size=config.data.params.val.params.size,
-        set="val",
-    )
+    train_dataset = instantiate_from_config(config.data.params.train)
+    val_dataset = instantiate_from_config(config.data.params.val)
 
-    batch_size = model.config["train_micro_batch_size_per_gpu"]
+    batch_size = int(model.config["train_micro_batch_size_per_gpu"])
     train_loader = DataLoader(
         train_dataset,
         num_workers=config.data.params.num_workers,
@@ -199,8 +223,9 @@ if __name__ == "__main__":
         ),
     )
 
-    val_diffusion_steps = 100
-    val_start_code = torch.randn([batch_size, 4, 512 // 8, 512 // 8], dtype=dtype, device="cuda")
+    DEVICE = "cuda"
+    val_diffusion_steps = 5
+    val_start_code = torch.randn([batch_size, 4, 512 // 8, 512 // 8], dtype=dtype, device=DEVICE)
     val_sampler = PLMSSampler(model.module) if args.pmls else DDIMSampler(model.module)
     val_guidance_scale = 7.5
     val_eta = 0.0  # has to be zero for PMLS
@@ -218,7 +243,12 @@ if __name__ == "__main__":
     save_every = 2000
     global_step = -1
     update_step = 0
+    examples_seen = 0
+    logged_real_images = False
+    start_time = time.time()
+
     for epoch in range(args.max_epochs):
+        logger.info(f"Starting epoch {epoch + 1} / {args.max_epochs}")
         for batch in tqdm(train_loader):
             global_step += 1
 
@@ -227,74 +257,93 @@ if __name__ == "__main__":
             model.backward(loss)
             model.step()
 
-            if wandb.run is not None and model.is_gradient_accumulation_boundary():
+            examples_seen += batch_size * dist.get_world_size()
+
+            if model.is_gradient_accumulation_boundary():
+                # it's important that this one is separate from the next if
                 update_step += 1
+
+            if wandb.run is not None and model.is_gradient_accumulation_boundary():
+                examples_per_second = examples_seen / (time.time() - start_time)
                 wandb.log({
                     "loss": loss,
                     "lr": optimizer.param_groups[0]["lr"],
                     "epoch": epoch,
+                    "examples_seen": examples_seen,
+                    "examples_per_second": examples_per_second,
                     **loss_dict,
                     },
                     step=global_step,
                 )
-            
+
             # --- Validation starts
             if global_step % eval_every == 0:
-                val_batch = next(iter(val_loader))  # predict just one batch
-                prompts = val_batch[model.cond_stage_key]
+                logger.info(f"Starting validation at step {global_step}")
                 all_generated_images = []
+                all_real_images = []
                 all_prompts = []
 
-                with torch.no_grad():
-                    with model.ema_scope():
-                        uc = model.get_learned_conditioning(batch_size * [""])
+                for i, val_batch in enumerate(val_loader):
+                    if i > 0: break  # only 1 batch
+
+                    prompts = val_batch[model.cond_stage_key]
+                    prompts_gathered = gather_object(prompts)
+                    all_prompts.extend(prompts_gathered)
+
+                    if not logged_real_images:
+                        images = val_batch[model.first_stage_key]
+                        images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
+
+                        images_gathered = gather_tensor(images)
+                        images_gathered = postprocess_image(images_gathered)
+                        all_real_images.extend(images_gathered)
+                        if wandb.run is not None:
+                            images_log = [wandb.Image(im, caption=p) for im, p in zip(all_real_images, all_prompts)]
+                            wandb.log({"val/real_images": images_log}, step=global_step)
+                        logged_real_images = True
+
+                    with torch.no_grad(), model.ema_scope():
                         c = model.get_learned_conditioning(prompts)
+                        uc = model.get_unconditional_conditioning(batch_size, seq_len=c.shape[1])
+
+                        generated_images = []
+
                         assert uc.dtype is dtype
                         assert c.dtype is dtype
 
-                        generated_latent_images, intermediates = val_sampler.sample(
-                            num_steps=val_diffusion_steps,
-                            conditioning=c,
-                            unconditional_conditioning=uc,
-                            shape=val_target_shape,
-                            unconditional_guidance_scale=val_guidance_scale,
-                            eta=val_eta,
-                            x_T=val_start_code,
-                            batch_size=batch_size,
-                            verbose=False,
-                        )
+                        for p_idx in range(batch_size):
+                            # generate one batch of images for each prompt
+                            # intermediates is a dict with keys 'x_inter', 'pred_x0'
+                            # x_inter is a list of tensors of shape [batch_size, 4, 64, 64]
+                            _c = repeat(c[p_idx], "... -> repeat ...", repeat=batch_size)
+                            _uc = repeat(uc[p_idx], "... -> repeat ...", repeat=batch_size)
 
-                        # intermediates is a dict with keys 'x_inter', 'pred_x0'
-                        # x_inter is a list of tensors of shape [batch_size, 4, 64, 64]
+                            _generated_latent_images, intermediates = val_sampler.sample(
+                                num_steps=val_diffusion_steps,
+                                conditioning=_c,
+                                unconditional_conditioning=_uc,
+                                shape=val_target_shape,
+                                unconditional_guidance_scale=val_guidance_scale,
+                                eta=val_eta,
+                                x_T=val_start_code,
+                                batch_size=batch_size,
+                                verbose=False,
+                            )
 
-                        generated_images = model.decode_first_stage(generated_latent_images)
-                        generated_images_gathered = None
-                        if global_rank == 0:
-                            generated_images_gathered = [torch.zeros_like(generated_images) for _ in range(dist.get_world_size())]
-                        dist.gather(generated_images, gather_list=generated_images_gathered, dst=0)
+                            _generated_images = model.decode_first_stage(_generated_latent_images)
+                            _generated_images = torchvision.utils.make_grid(_generated_images, nrow=batch_size)  # [3, 512, 512 * batch_size]
+                            generated_images.append(_generated_images)
 
-                        # gather prompts
-                        prompts_gathered = None
-                        if global_rank == 0:
-                            prompts_gathered = [None] * dist.get_world_size()
-                        dist.gather_object(prompts, object_gather_list=prompts_gathered, dst=0)
+                        generated_images = torch.stack(generated_images, dim=0)  # [batch_size, 3, 512, 512 * batch_size]
+                        generated_images = gather_tensor(generated_images)
+                        generated_images = postprocess_image(generated_images)  # returns numpy array
+                        all_generated_images.append(generated_images)
 
-                        if global_rank == 0:
-                            prompts_gathered = [item for sublist in prompts_gathered for item in sublist]
-    
-                            generated_images = torch.cat(generated_images_gathered, dim=0)
-                            generated_images = postprocess_image(generated_images)  # return numpy array
-                            all_generated_images.append(generated_images)
-                            all_prompts.extend(prompts_gathered)
-                
                 # end of inference
                 if global_rank == 0:
                     all_generated_images = np.concatenate(all_generated_images, axis=0)
-                    wandb.log({
-                        "val/generated_images_images": [wandb.Image(im, caption=p) for im, p in zip(generated_images, all_prompts)],
-                        },
-                        step=global_step,
-                    )
+                    images_log = [wandb.Image(im, caption=p) for im, p in zip(all_generated_images, all_prompts)]
+                    wandb.log({"val/generated_images_row": images_log}, step=global_step)
 
             # --- Validation ends
 
@@ -308,4 +357,6 @@ if __name__ == "__main__":
                 }
 
                 model.save_checkpoint(ckptdir, client_state=meta)
-                logger.info(f"Saved model at step {global_step}")
+                logger.info(f"Saved model to {ckptdir} at step {global_step}")
+
+    logger.info(f"Training finished successfully")

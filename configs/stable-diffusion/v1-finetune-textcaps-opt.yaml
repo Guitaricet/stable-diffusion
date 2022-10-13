@@ -58,9 +58,11 @@ model:
           target: torch.nn.Identity
 
     cond_stage_config:
-      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+      target: ldm.modules.encoders.hug_models.FrozenHugEmbedderWithAdapter
       params:
+        model_name: "facebook/opt-350m"
         max_length: 77  # default value from FrozenCLIPEmbedder
+        output_dim: 768
 
 data:
   target: main.DataModuleFromConfig
@@ -92,10 +94,10 @@ deepspeed:
     type: WarmupLR
     params:
       warmup_type: linear
-      warmup_min_lr: 1e-7
+      warmup_min_lr: 1e-6
       warmup_max_lr: 3.0e-04
-      warmup_num_steps: 1000
+      warmup_num_steps: 500
   bf16:
     enabled: True
   zero_optimization:
-    stage: 2
+    stage: 1  # if we only tune the adapters, optimizer states are very small (a few M)
