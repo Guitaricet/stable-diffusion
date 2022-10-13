@@ -108,8 +108,46 @@ For this reason `use_ema=False` is set in the configuration, otherwise the code 
 non-EMA to EMA weights. If you want to examine the effect of EMA vs no EMA, we provide "full" checkpoints
 which contain both types of weights. For these, `use_ema=False` will load and use the non-EMA weights.
 
+### Texty Caps Dataset
 
-## Comments 
+Uploading to google cloud:
+
+
+```bash
+for d in shard_*;
+    do echo $d;
+    tar --sort=name -cf "texty-caps-train-$d.tar" $d;
+    gsutil -o GSUtil:parallel_composite_upload_threshold=150M cp "texty-caps-train-$d.tar" "gs://texty-caps/texty-caps-train-$d.tar";
+    rm -f "texty-caps-train-$d.tar";
+done
+```
+
+```bash
+for d in texty-caps-train-shard_000110.tar \
+  texty-caps-train-shard_000111.tar \
+  texty-caps-train-shard_000112.tar \
+  texty-caps-train-shard_000113.tar \
+  texty-caps-train-shard_000114.tar \
+  texty-caps-train-shard_000115.tar \
+  texty-caps-train-shard_000116.tar \
+  texty-caps-train-shard_000126.tar \
+  texty-caps-train-shard_000127.tar \
+  texty-caps-train-shard_000137.tar \
+  texty-caps-train-shard_000138.tar \
+  texty-caps-train-shard_000139.tar \
+  texty-caps-train-shard_000140.tar \
+  texty-caps-train-shard_000141.tar \
+  texty-caps-train-shard_000142.tar \
+  texty-caps-train-shard_000143.tar \
+  texty-caps-train-shard_000144.tar;
+    do echo $d;
+    gsutil cp "gs://texty-caps/$d" "$d";
+    tar -xf "$d";
+    rm -f "$d";
+done
+
+
+## Comments
 
 - Stable Diffusion codebase for the diffusion models builds heavily on [OpenAI's ADM codebase](https://github.com/openai/guided-diffusion)
 and [https://github.com/lucidrains/denoising-diffusion-pytorch](https://github.com/lucidrains/denoising-diffusion-pytorch). 
