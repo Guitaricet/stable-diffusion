@@ -60,7 +60,7 @@ model:
     cond_stage_config:
       target: ldm.modules.encoders.hug_models.FrozenHugEmbedderWithAdapter
       params:
-        model_name: "facebook/opt-350m"
+        model_name: "facebook/opt-1.3b"
         max_length: 77  # default value from FrozenCLIPEmbedder
         output_dim: 768
 
@@ -83,8 +83,8 @@ data:
 
 deepspeed:
   # train_batch_size: 96 # total batch size across all gpus
-  train_micro_batch_size_per_gpu: 8  # it's easier to max out the gpu memory if we use control per-gpu batch size
-  gradient_accumulation_steps: 8
+  train_micro_batch_size_per_gpu: 6  # it's easier to max out the gpu memory if we use control per-gpu batch size
+  gradient_accumulation_steps: 11
   optimizer:
     type: Adam
     params:

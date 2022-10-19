@@ -229,9 +229,3 @@ class FrozenClipImageEmbedder(nn.Module):
     def forward(self, x):
         # x is assumed to be in range [-1,1]
         return self.model.encode_image(self.preprocess(x))
-
-
-if __name__ == "__main__":
-    from ldm.util import count_params
-    model = FrozenCLIPEmbedder()
-    count_params(model, verbose=True)

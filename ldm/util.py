@@ -1,16 +1,15 @@
 import importlib
-
-import torch
-import numpy as np
-from collections import abc
-from einops import rearrange
-from functools import partial
-
 import multiprocessing as mp
+
+from collections import abc
+from inspect import isfunction
 from threading import Thread
 from queue import Queue
 
-from inspect import isfunction
+import torch
+import torch.utils.data
+import numpy as np
+
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -108,10 +107,6 @@ def _do_parallel_data_prefetch(func, Q, data, idx, idx_to_fn=False):
 def parallel_data_prefetch(
         func: callable, data, n_proc, target_data_type="ndarray", cpu_intensive=True, use_worker_id=False
 ):
-    # if target_data_type not in ["ndarray", "list"]:
-    #     raise ValueError(
-    #         "Data, which is passed to parallel_data_prefetch has to be either of type list or ndarray."
-    #     )
     if isinstance(data, np.ndarray) and target_data_type == "list":
         raise ValueError("list expected but function got ndarray.")
     elif isinstance(data, abc.Iterable):

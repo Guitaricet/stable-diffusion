@@ -150,17 +150,34 @@ class SpatialSelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., use_lora=False):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
+        self.use_lora = use_lora
         self.scale = dim_head ** -0.5
         self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        if use_lora:
+            # https://arxiv.org/pdf/2106.09685.pdf Table 6 suggests that 8 works well
+            lora_dim = 8
+            self.to_q_lora = zero_module(nn.Sequential(
+                nn.Linear(query_dim, lora_dim, bias=False),
+                nn.Linear(lora_dim, inner_dim, bias=False),
+            ))
+            self.to_k_lora = zero_module(nn.Sequential(
+                nn.Linear(context_dim, lora_dim, bias=False),
+                nn.Linear(lora_dim, inner_dim, bias=False),
+            ))
+            self.to_v_lora = zero_module(nn.Sequential(
+                nn.Linear(context_dim, lora_dim, bias=False),
+                nn.Linear(lora_dim, inner_dim, bias=False),
+            ))
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
@@ -174,6 +191,15 @@ class CrossAttention(nn.Module):
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
+
+        if self.use_lora:
+            q_lora = self.to_q_lora(x)
+            k_lora = self.to_k_lora(context)
+            v_lora = self.to_v_lora(context)
+
+            q = q + q_lora
+            k = k + k_lora
+            v = v + v_lora
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
@@ -194,12 +220,22 @@ class CrossAttention(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
-    def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        dropout=0.,
+        context_dim=None,
+        gated_ff=True,
+        checkpoint=True,
+        use_lora=False,
+    ):
         super().__init__()
-        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout)  # is a self-attention
+        self.attn1 = CrossAttention(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout, use_lora=use_lora)  # is a self-attention
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
         self.attn2 = CrossAttention(query_dim=dim, context_dim=context_dim,
-                                    heads=n_heads, dim_head=d_head, dropout=dropout)  # is self-attn if context is none
+                                    heads=n_heads, dim_head=d_head, dropout=dropout, use_lora=use_lora)  # is self-attn if context is none
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
@@ -209,9 +245,20 @@ class BasicTransformerBlock(nn.Module):
         return checkpoint(self._forward, (x, context), self.parameters(), self.checkpoint)
 
     def _forward(self, x, context=None):
-        x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context) + x
-        x = self.ff(self.norm3(x)) + x
+        res = x
+        x = self.norm1(x)
+        x = self.attn1(x)
+        x = res + x
+
+        res = x
+        x = self.norm2(x)
+        x = self.attn2(x, context=context)
+        x = res + x
+
+        res = x
+        x = self.norm3(x)
+        x = self.ff(x)
+        x = res + x
         return x
 
 
@@ -223,8 +270,16 @@ class SpatialTransformer(nn.Module):
     Then apply standard transformer action.
     Finally, reshape to image
     """
-    def __init__(self, in_channels, n_heads, d_head,
-                 depth=1, dropout=0., context_dim=None):
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        depth=1,
+        dropout=0.,
+        context_dim=None,
+        use_lora=False,
+    ):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
@@ -236,10 +291,15 @@ class SpatialTransformer(nn.Module):
                                  stride=1,
                                  padding=0)
 
-        self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim)
-                for d in range(depth)]
-        )
+        self.transformer_blocks = nn.ModuleList([
+            BasicTransformerBlock(
+                inner_dim, n_heads, d_head,
+                dropout=dropout,
+                context_dim=context_dim,
+                use_lora=use_lora,
+            )
+            for _ in range(depth)
+        ])
 
         self.proj_out = zero_module(nn.Conv2d(inner_dim,
                                               in_channels,

@@ -33,6 +33,7 @@ model:
         context_dim: 768
         use_checkpoint: True
         legacy: False
+        use_lora: True
 
     first_stage_config:
       target: ldm.models.autoencoder.AutoencoderKL
@@ -70,11 +71,10 @@ data:
     num_workers: 4
     wrap: false
     train:
-      target: ldm.data.textcaps.TextCapsBase
+      target: ldm.data.textycaps.TextyCaps
       params:
-        data_root: ../../data/TextCaps
+        data_root: ../../data/text-laion-20M-images-with-text-train
         size: 512
-        set: train
     val:
       target: ldm.data.textcaps.TextCapsBase
       params:
@@ -84,8 +84,8 @@ data:
 
 deepspeed:
   # train_batch_size: 96 # total batch size across all gpus
-  train_micro_batch_size_per_gpu: 8  # it's easier to max out the gpu memory if we use control per-gpu batch size
-  gradient_accumulation_steps: 8
+  train_micro_batch_size_per_gpu: 6  # it's easier to max out the gpu memory if we use control per-gpu batch size
+  gradient_accumulation_steps: 11
   optimizer:
     type: Adam
     params:
@@ -100,4 +100,4 @@ deepspeed:
   bf16:
     enabled: True
   zero_optimization:
-    stage: 1  # if we only tune the adapters, optimizer states are very small (a few M)
+    stage: 2  # if we only tune the adapters, optimizer states are very small (a few M)

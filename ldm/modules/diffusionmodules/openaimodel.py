@@ -474,6 +474,7 @@ class UNetModel(nn.Module):
         context_dim=None,                 # custom transformer support
         n_embed=None,                     # custom support for prediction of discrete ids into codebook of first stage vq model
         legacy=True,
+        use_lora=False,
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -554,17 +555,25 @@ class UNetModel(nn.Module):
                     if legacy:
                         #num_heads = 1
                         dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
-                    layers.append(
-                        AttentionBlock(
+                    
+                    if use_spatial_transformer:
+                        _layer = SpatialTransformer(
+                            ch, num_heads, dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            use_lora=use_lora,
+                        )
+                    else:
+                        _layer = AttentionBlock(
                             ch,
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads,
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
-                        ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
                         )
-                    )
+
+                    layers.append(_layer)
+
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
@@ -616,9 +625,14 @@ class UNetModel(nn.Module):
                 num_heads=num_heads,
                 num_head_channels=dim_head,
                 use_new_attention_order=use_new_attention_order,
-            ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
-                        ),
+                use_lora=use_lora,
+            ) if not use_spatial_transformer else \
+            SpatialTransformer(
+                ch, num_heads, dim_head,
+                depth=transformer_depth,
+                context_dim=context_dim,
+                use_lora=use_lora,
+            ),
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -662,8 +676,13 @@ class UNetModel(nn.Module):
                             num_heads=num_heads_upsample,
                             num_head_channels=dim_head,
                             use_new_attention_order=use_new_attention_order,
-                        ) if not use_spatial_transformer else SpatialTransformer(
-                            ch, num_heads, dim_head, depth=transformer_depth, context_dim=context_dim
+                            use_lora=use_lora,
+                        ) if not use_spatial_transformer else \
+                        SpatialTransformer(
+                            ch, num_heads, dim_head,
+                            depth=transformer_depth,
+                            context_dim=context_dim,
+                            use_lora=use_lora,
                         )
                     )
                 if level and i == num_res_blocks:

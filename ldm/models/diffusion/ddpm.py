@@ -881,6 +881,11 @@ class LatentDiffusion(DDPM):
         return loss
 
     def forward(self, x, c, *args, **kwargs):
+        """
+        Args:
+            x: input image, shape (batch_size, latent_channels, latent_height, latent_width), e.g. (batch_size, 4, 64, 64)
+            c: conditioning, shape (batch_size, cond_seq_len, cond_hidden)
+        """
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:
             assert c is not None
