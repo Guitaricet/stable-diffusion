@@ -165,7 +165,7 @@ class PLMSSampler(object):
         if verbose:
             print(f"Running PLMS Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps)
+        iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps, disable=not verbose)
         old_eps = []
 
         for i, step in enumerate(iterator):
