@@ -10,7 +10,7 @@ from PIL import Image
 from numpy import asarray
 from einops import rearrange, repeat
 import torch, torchvision
-from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.models.diffusion.ddim_sampler import DDIMSampler
 from ldm.util import ismap
 import time
 from omegaconf import OmegaConf

@@ -16,8 +16,8 @@ import time
 from pytorch_lightning import seed_everything
 
 from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
+from ldm.models.diffusion.ddim_sampler import DDIMSampler
+from ldm.models.diffusion.plms_sampler import PLMSSampler
 
 
 def chunk(it, size):

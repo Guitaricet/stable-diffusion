@@ -14,8 +14,8 @@ import time
 from multiprocessing import cpu_count
 
 from ldm.util import instantiate_from_config, parallel_data_prefetch
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
+from ldm.models.diffusion.ddim_sampler import DDIMSampler
+from ldm.models.diffusion.plms_sampler import PLMSSampler
 from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
 
 DATABASES = [

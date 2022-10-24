@@ -1,6 +1,6 @@
 # based on https://github.com/rinongal/textual_inversion/blob/5862ea4e3500a1042595bc199cfe5335703a458e/configs/stable-diffusion/v1-finetune.yaml
 model:
-  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  target: ldm.models.diffusion.latent_diffusion.LatentDiffusion
   params:
     linear_start: 0.00085
     linear_end: 0.0120

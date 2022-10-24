@@ -1,6 +1,7 @@
 # based on https://github.com/rinongal/textual_inversion/blob/5862ea4e3500a1042595bc199cfe5335703a458e/ldm/data/personalized.py
 import os
 import json
+import time
 from glob import glob
 
 import numpy as np
@@ -10,6 +11,10 @@ from datasets import Dataset as HFDataset
 
 from tqdm.auto import tqdm
 from loguru import logger
+
+
+def _item_exists(image_path):
+    return os.path.exists(image_path) and os.path.exists(image_path.replace(".jpg", ".json"))
 
 
 class TextyCaps(torch.utils.data.Dataset):
@@ -47,6 +52,16 @@ class TextyCaps(torch.utils.data.Dataset):
             self.data = HFDataset.from_list(data)
             self.data.save_to_disk(hf_dataset_path)
 
+        logger.info(f"Filtering dataset, removing images without metadata and metedata without images...")
+        _time = time.time()
+        _len_before_filtering = len(self.data)
+        self.data.filter(self._filter_nonexistant, batched=True, num_proc=8)
+        logger.info(f"Dataset filtered, {len(self.data)} items remaining out of {_len_before_filtering}, {100 * len(self.data) / _len_before_filtering:.2f}%")
+        logger.info(f"Filtering took {time.time() - _time:.2f} seconds")
+
+        self.size = size
+        self.interpolation = interpolation
+
         self.num_images = len(self.data)
         self._length = self.num_images
 
@@ -62,7 +77,6 @@ class TextyCaps(torch.utils.data.Dataset):
     def __getitem__(self, i):
         item = self.data[i]
         image_path, caption_str = item["image_path"], item["caption"]
-        image_path = os.path.join(self.data_root, image_path)
 
         example = {}
         image = Image.open(image_path)
@@ -106,3 +120,7 @@ class TextyCaps(torch.utils.data.Dataset):
         logger.info(f"{n_missing_files} missing files when loading data from {data_root}")
         logger.info(f"Remaining items: {len(data)}")
         return data
+
+    @staticmethod
+    def _filter_nonexistant(items):
+        return [_item_exists(path) for path in items["image_path"]]

@@ -23,7 +23,7 @@ def compute_fid(
     generated_images,
     batch_size=64,
     cuda=None,
-    verbose=True,
+    verbose=False,
 ):
     """
     Compute the FID score between real and generated images.
@@ -36,6 +36,12 @@ def compute_fid(
     :return: (float) FID score.
     """
     cuda = cuda if cuda is not None else torch.cuda.is_available()
+
+    if isinstance(real_images[0], np.ndarray):
+        real_images = [torch.tensor(img) for img in real_images]
+    
+    if isinstance(generated_images[0], np.ndarray):
+        generated_images = [torch.tensor(img) for img in generated_images]
 
     real_images_dataset = ImagesDataset(real_images)
     generated_images_dataset = ImagesDataset(generated_images)

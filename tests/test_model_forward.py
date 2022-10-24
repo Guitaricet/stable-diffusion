@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from omegaconf import OmegaConf
 
 from ldm.util import instantiate_from_config

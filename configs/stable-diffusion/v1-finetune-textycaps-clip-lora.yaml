@@ -33,7 +33,7 @@ model:
         context_dim: 768
         use_checkpoint: True
         legacy: False
-        use_lora: True
+        use_lora: False
 
     first_stage_config:
       target: ldm.models.autoencoder.AutoencoderKL
@@ -59,11 +59,7 @@ model:
           target: torch.nn.Identity
 
     cond_stage_config:
-      target: ldm.modules.encoders.hug_models.FrozenHugEmbedderWithAdapter
-      params:
-        model_name: "facebook/opt-1.3b"
-        max_length: 128  # default value from FrozenCLIPEmbedder
-        output_dim: 768
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
 
 data:
   target: main.DataModuleFromConfig
@@ -83,9 +79,8 @@ data:
         set: val
 
 deepspeed:
-  # train_batch_size: 96 # total batch size across all gpus
-  train_micro_batch_size_per_gpu: 6  # it's easier to max out the gpu memory if we use control per-gpu batch size
-  gradient_accumulation_steps: 11
+  train_micro_batch_size_per_gpu: 8  # it's easier to max out the gpu memory if we use control per-gpu batch size
+  gradient_accumulation_steps: 8
   optimizer:
     type: Adam
     params:

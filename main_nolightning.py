@@ -26,18 +26,14 @@ from omegaconf import OmegaConf
 
 from pytorch_lightning import seed_everything
 from einops import rearrange, repeat
-from transformers import AutoProcessor, AutoModel
 
 from loguru import logger
 from tqdm import tqdm
 
-import ldm
-import ldm.data.textcaps
 from ldm.util import instantiate_from_config
-from ldm.data.base import Txt2ImgIterableBaseDataset
-from ldm.models.diffusion.ddpm import LatentDiffusion
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
+from ldm.models.diffusion.latent_diffusion import LatentDiffusion
+from ldm.models.diffusion.ddim_sampler import DDIMSampler
+from ldm.models.diffusion.plms_sampler import PLMSSampler
 from ldm.metrics.clip_score import CLIPScore
 from ldm.metrics.fid import compute_fid
 
@@ -69,6 +65,7 @@ def parse_args(**parser_kwargs):
     parser.add_argument("--actual_resume", type=str, default="", help="Path to model to actually resume from")
     parser.add_argument("--train_only_adapters", action="store_true", default=False, help="Only train FFN between text model and diffusion model")
     parser.add_argument("--lora", action="store_true", default=False, help="Use LORA adapters for U-Net attention modules")
+    parser.add_argument("--conditioning_drop", type=float, default=0.0, help="Probabiblity of dropping of the text-conditioning to improve classifier-free guidance sampling")
 
     # Evaluation arguments
     parser.add_argument("--eval_every", type=int, default=1000, help="evaluate every n steps")
@@ -139,7 +136,8 @@ def gather_object(x):
     dist.gather_object(x, object_gather_list=gather_list, dst=0)
 
     if dist.get_rank() == 0:
-        gather_list = [item for sublist in gather_list for item in sublist]
+        if isinstance(gather_list[0], list):
+            return [item for sublist in gather_list for item in sublist]
         return gather_list
 
 
@@ -190,7 +188,7 @@ def generate_images_grid(*, sampler, model, prompts, images_per_prompt, diffusio
 
 
 @torch.no_grad()
-def generate_images(*, sampler, model, prompts, diffusion_steps, target_shape, guidance_scale, eta, start_code):
+def generate_images(*, sampler, model, prompts, diffusion_steps, target_shape, guidance_scale, eta, start_code, gather=True):
     """
     Returns:
         generated_images: numpy *uint8* tensor of shape [batch_size, 512, 512, 3]
@@ -211,6 +209,10 @@ def generate_images(*, sampler, model, prompts, diffusion_steps, target_shape, g
     )
 
     generated_images = model.decode_first_stage(generated_latent_images)
+    if not gather:
+        generated_images = postprocess_image(generated_images)
+        return generated_images
+
     generated_images = gather_tensor(generated_images)
 
     if dist.get_rank() == 0:
@@ -261,20 +263,21 @@ if __name__ == "__main__":
         model = load_model_from_config(config, args.actual_resume)
     else:
         model = instantiate_from_config(config.model)
-    
+
     if args.train_only_adapters:
         adapter_parameters = [p for n, p in model.named_parameters() if "adapter" in n]
         blank_conditioning_parameters = [p for n, p in model.named_parameters() if "blank_conditioning" in n]
         lora_parameters = [p for n, p in model.named_parameters() if "lora" in n]
 
-        logger.info(f"\tAdapter parameters: {param_count(adapter_parameters) // 1e6}M")
-        logger.info(f"\tBlank conditioning parameters: {param_count(blank_conditioning_parameters) // 1e6}M")
-        logger.info(f"\tLoRa parameters: {param_count(lora_parameters) // 1e6}M")
+        logger.info(f"\tAdapter parameters: {param_count(adapter_parameters) / 1e6:.2f}M")
+        logger.info(f"\tBlank conditioning parameters: {param_count(blank_conditioning_parameters) / 1e6:.2f}M")
+        logger.info(f"\tLoRa parameters: {param_count(lora_parameters) / 1e6:.2f}M")
+        trainable_parameters = adapter_parameters + blank_conditioning_parameters + lora_parameters
     else:
         trainable_parameters = [p for p in model.parameters() if p.requires_grad]
 
     logger.info(f"Number of model parameters    : {param_count(model.parameters()) // 1e6}M")
-    logger.info(f"Number of trainable parameters: {param_count(trainable_parameters) // 1e6}M")
+    logger.info(f"Number of trainable parameters: {param_count(trainable_parameters) / 1e6}M")
     optimizer = torch.optim.Adam(trainable_parameters, lr=config.deepspeed.optimizer.params.lr)
 
     model, optimizer, _, _ = deepspeed.initialize(
@@ -293,7 +296,7 @@ if __name__ == "__main__":
 
     # convert model inputs to dtype
     model.set_data_dtype(dtype)
-    clip_score = CLIPScore(device=DEVICE, dtype=dtype, distributed=True)
+    clip_score = CLIPScore(device=DEVICE, dtype=dtype, distributed=False)  # compute them independently on different GPUs, then gather and average
 
     if global_rank == 0:
         config_dict = OmegaConf.to_container(config, resolve=True)
@@ -361,9 +364,35 @@ if __name__ == "__main__":
         for batch in tqdm(train_loader):
             global_step += 1
 
-            loss, loss_dict = model.shared_step(batch)
+            x, c = model.get_input(batch, model.first_stage_key)  # no grad
+            # x is [batch_size, 3, 512, 512]
+            # c is list of srtings
+
+            # Replace 10% of the conditioning with unconditional conditioning
+            # if args.conditioning_drop > 0.0:
+            #     import remote_pdb; remote_pdb.set_trace()
+            #     mask = torch.rand(c.shape[0], dtype=torch.float32, device=c.device) < args.conditioning_drop
+            #     c = c * (1 - mask[:, None, None, None]) + mask[:, None, None, None] * model.module.blank_conditioning
+
+            # if torch.randn(1).item() < args.conditioning_drop:
+            #     _seq_len = model.cond_stage_model.max_length
+            #     c = model.get_unconditional_conditioning(len(c), seq_len=_seq_len)
+
+            if args.conditioning_drop > 0.0:
+                for i in range(len(c)):
+                    if torch.rand(1).item() < args.conditioning_drop:
+                        c[i] = ""
+
+            pad_to_max_len = False
+            if all([len(cc) == 0 for cc in c]):
+                pad_to_max_len = True
+
+            loss, loss_dict = model(x, c, pad_to_max_len=pad_to_max_len)
 
             model.backward(loss)
+            # model.cond_stage_model.blank_conditioning.grad
+            import remote_pdb; remote_pdb.set_trace()
+
             model.step()
 
             examples_seen += batch_size * dist.get_world_size()
@@ -399,7 +428,7 @@ if __name__ == "__main__":
                     prompts = val_batch[model.cond_stage_key]
                     prompts_gathered = gather_object(prompts)
                     if global_rank == 0:
-                        all_prompts.extend(prompts_gathered)
+                        all_prompts.extend(prompts)
 
                     # TODO: move logging real imges to before the loop
                     if not logged_real_images:
@@ -453,26 +482,22 @@ if __name__ == "__main__":
                 all_real_images = []
                 all_prompts = []
 
-                logger.warning("Only two batches for CLIP and FID")
-                n_batches = 2
+                n_val_batches = min(50, len(val_loader))
                 _desc = f"Validation at step {global_step}, generating images for CLIP and FID scores"
-                for i, val_batch in enumerate(tqdm(val_loader, total=n_batches, desc=_desc, disable=global_rank != 0)):
-                    if i >= n_batches: break
+                for i, val_batch in enumerate(tqdm(val_loader, total=n_val_batches, desc=_desc, disable=global_rank != 0)):
+                    if i >= n_val_batches: break
                     prompts = val_batch[model.cond_stage_key]
-                    prompts_gathered = all_gather_object(prompts)
-                    assert len(prompts_gathered) == dist.get_world_size() * len(prompts)
-                    all_prompts.extend(prompts_gathered)
+                    all_prompts.extend(prompts)
 
                     images = val_batch[model.first_stage_key]
                     images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
-                    images_gathered = gather_tensor(images)
-                    if global_rank == 0:
-                        images_gathered = postprocess_image(images_gathered)
-                        all_real_images.extend(images_gathered)
+                    images = postprocess_image(images)
+                    all_real_images.extend(images)
 
                     with model.ema_scope():
                         # returns [batch_size, 512, 512, 3] numpy array
-                        assert len(prompts) == batch_size
+                        if i < len(val_loader):  # last batch might be truncated
+                            assert len(prompts) == batch_size, (len(prompts), batch_size)
 
                         generated_images = generate_images(
                             sampler=val_sampler,
@@ -483,57 +508,48 @@ if __name__ == "__main__":
                             guidance_scale=val_guidance_scale,
                             eta=val_eta,
                             start_code=val_start_code,
+                            gather=False,
                         )
-                        if global_rank == 0:
-                            assert generated_images.shape == (batch_size * dist.get_world_size(), 512, 512, 3), generated_images.shape
-                            # if generated_images.dtype is not np.dtype("uint8"):
-                            #     print(generate_images.dtype)
+                        assert generated_images.shape == (batch_size, 512, 512, 3), generated_images.shape
+                        all_generated_images.append(generated_images)
 
-                            all_generated_images.append(generated_images)
-                        else:
-                            assert generated_images is None
+                assert len(all_generated_images) == n_val_batches
+                assert all_generated_images[0].shape == (batch_size, 512, 512, 3)
+                all_generated_images = np.concatenate(all_generated_images, axis=0)
 
-                if global_rank == 0:
-                    # import remote_pdb; remote_pdb.set_trace()
-                    # concat along a new axis
-                    assert len(all_generated_images) == n_batches
-                    assert all_generated_images[0].shape == (batch_size * dist.get_world_size(), 512, 512, 3)
-                    all_generated_images = np.concatenate(all_generated_images, axis=0)
-                    all_generated_images = torch.tensor(all_generated_images, dtype=torch.uint8).to(DEVICE)
-                    assert all_generated_images.shape == (n_batches * batch_size * dist.get_world_size(), 512, 512, 3)
-                else:
-                    # 252, 512, 512, 3
-                    _num_images = len(all_prompts)
-                    assert _num_images == i * batch_size * dist.get_world_size()
-                    all_generated_images = torch.zeros([_num_images, 512, 512, 3], dtype=torch.uint8).to(DEVICE)
-
-                assert all_generated_images.shape == (batch_size * dist.get_world_size() * n_batches, 512, 512, 3), f"Before broadcast: {all_generated_images.shape} != {(batch_size * dist.get_world_size() * n_batches, 512, 512, 3)}"
-                dist.broadcast(tensor=all_generated_images, src=0)
-                assert all_generated_images.shape == (batch_size * dist.get_world_size() * n_batches, 512, 512, 3), f"After broadcast: {all_generated_images.shape} != {(batch_size * dist.get_world_size() * n_batches, 512, 512, 3)}"
-                # all_generated_images = torch.clip(all_generated_images, -1, 1).cpu()
-
-                if all_generated_images is not None:
-                    logger.info(f"{global_rank}: after broadcast {all_generated_images.shape}")
-
-                print(f"{all_generated_images.dtype=}")
-                print(f"{all_generated_images.shape=}")
-                assert all_generated_images.shape[1:] == (512, 512, 3), all_generated_images.shape
-
-                all_generated_images = all_generated_images.cpu().permute(0, 3, 1, 2)
-                all_generated_images = [torchvision.transforms.functional.to_pil_image(im) for im in all_generated_images]  # honestly, this is much easier than work with tensors
+                logger.info("Computing CLIP scores")
                 clip_score_value = clip_score.compute(captions=all_prompts, images=all_generated_images, batch_size=args.clip_score_batch_size)
 
+                logger.info("Computing FID scores")
+                assert len(all_real_images) == len(all_generated_images)
+                assert len(all_real_images) == batch_size * n_val_batches
+                assert all_real_images[0].shape == (512, 512, 3), all_real_images[0].shape
+
+                all_real_images = np.transpose(all_real_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
+                all_generated_images = np.transpose(all_generated_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
+                fid_score_value = compute_fid(all_real_images, all_generated_images, batch_size=args.clip_score_batch_size)  # doesn't support distirubted
+
+                clip_score_value = gather_object(clip_score_value)
+                fid_score_value = gather_object(fid_score_value)
+
                 if global_rank == 0:
-                    fid = compute_fid(all_real_images, all_generated_images, batch_size=args.clip_score_batch_size)  # doesn't support distirubted
+                    assert len(clip_score_value) == dist.get_world_size()
+                    assert isinstance(clip_score_value[0], float), clip_score_value[0]
+                    clip_score_value = np.mean(clip_score_value)
+
+                    assert len(fid_score_value) == dist.get_world_size()
+                    assert isinstance(fid_score_value[0], float), fid_score_value[0]
+                    fid_score_value = np.mean(fid_score_value)
+
                     wandb.log({
                         "val/clip_score": clip_score_value,
-                        "val/fid": fid,
-                        "val/harmonic_mean": 2 * (clip_score_value * fid) / (clip_score_value + fid),
+                        "val/fid": fid_score_value,
+                        "val/harmonic_mean": 2 * (clip_score_value * fid_score_value) / (clip_score_value + fid_score_value),
                         },
                         step=global_step,
                     )
 
-            logger.info(f"Validation at step {global_step} took {int(time.time() - _validation_time)} seconds")
+                logger.info(f"Validation at step {global_step} took {int(time.time() - _validation_time)} seconds")
             # --- Validation ends
 
             if global_step > 0 and global_step % save_every == 0:

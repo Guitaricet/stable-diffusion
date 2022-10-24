@@ -61,10 +61,11 @@ model:
     cond_stage_config:
       target: ldm.modules.encoders.hug_models.FrozenHugEmbedderWithAdapter
       params:
-        model_name: "facebook/opt-1.3b"
+        model_name: "facebook/opt-6.7b"
         max_length: 128  # default value from FrozenCLIPEmbedder
         output_dim: 768
-
+        load_in_int8: True
+        device_map: auto
 data:
   target: main.DataModuleFromConfig
   params:

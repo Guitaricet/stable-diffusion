@@ -6,11 +6,11 @@ from transformers import AutoTokenizer, AutoModel
 
 
 class FrozenHugEmbedderWithAdapter(nn.Module):
-    def __init__(self, model_name, max_length, output_dim):
+    def __init__(self, model_name, max_length, output_dim, **model_kwargs):
         super().__init__()
         # how to load just the encoder of t5?
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.transformer = AutoModel.from_pretrained(model_name)
+        self.transformer = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.freeze()  # freeze the transformer
 
         if hasattr(self.transformer.config, "d_model"):
@@ -41,17 +41,17 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         self.transformer = self.transformer.eval()
         for param in self.parameters():
             param.requires_grad = False
-    
-    def get_blank_conditioning(self, batch_size, seq_len):
-        return self.blank_conditioning.expand(batch_size, seq_len, -1)
 
-    def forward(self, text):
+    def forward(self, text, pad_to_max_length=False):
+        kwargs = {"padding": "max_length"} if pad_to_max_length else {}
+
         batch_encoding = self.tokenizer(
             text,
             truncation=True,
             max_length=self.max_length,
             padding=True,
             return_tensors="pt",
+            **kwargs,
         )
         batch_encoding = batch_encoding.to(self.device)
         outputs = self.transformer(**batch_encoding)
