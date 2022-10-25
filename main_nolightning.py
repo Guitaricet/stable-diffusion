@@ -36,6 +36,7 @@ from ldm.models.diffusion.ddim_sampler import DDIMSampler
 from ldm.models.diffusion.plms_sampler import PLMSSampler
 from ldm.metrics.clip_score import CLIPScore
 from ldm.metrics.fid import compute_fid
+from ldm.modules.encoders.modules import FrozenCLIPEmbedder
 
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()
@@ -368,17 +369,12 @@ if __name__ == "__main__":
             # x is [batch_size, 3, 512, 512]
             # c is list of srtings
 
-            # Replace 10% of the conditioning with unconditional conditioning
-            # if args.conditioning_drop > 0.0:
-            #     import remote_pdb; remote_pdb.set_trace()
-            #     mask = torch.rand(c.shape[0], dtype=torch.float32, device=c.device) < args.conditioning_drop
-            #     c = c * (1 - mask[:, None, None, None]) + mask[:, None, None, None] * model.module.blank_conditioning
-
-            # if torch.randn(1).item() < args.conditioning_drop:
-            #     _seq_len = model.cond_stage_model.max_length
-            #     c = model.get_unconditional_conditioning(len(c), seq_len=_seq_len)
-
             if args.conditioning_drop > 0.0:
+                if not isinstance(model.cond_stage_model, FrozenCLIPEmbedder):
+                    raise NotImplementedError("Conditioning drop is only implemented for FrozenCLIPEmbedder")
+                # this trick will work with clip conditioning,
+                # because model is already aware of its representations
+                # and because it uses "" for blank conditioning
                 for i in range(len(c)):
                     if torch.rand(1).item() < args.conditioning_drop:
                         c[i] = ""
@@ -391,7 +387,7 @@ if __name__ == "__main__":
 
             model.backward(loss)
             # model.cond_stage_model.blank_conditioning.grad
-            import remote_pdb; remote_pdb.set_trace()
+            # import remote_pdb; remote_pdb.set_trace()
 
             model.step()
 

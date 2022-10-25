@@ -22,7 +22,7 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         else:
             raise ValueError("Could not find transformer hidden size")
 
-        self.blank_conditioning = nn.Parameter(torch.zeros(1, 1, output_dim))
+        self.blank_conditioning = nn.Embedding(max_length, output_dim)
         self.adapter = nn.Sequential(
             nn.Linear(transformer_hidden, 4 * transformer_hidden),
             nn.SiLU(),  # SiLU(x) = Swish(x) = x * sigmoid(x)
@@ -42,13 +42,16 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
-    def forward(self, text, pad_to_max_length=False):
-        kwargs = {"padding": "max_length"} if pad_to_max_length else {}
+    def get_blank_conditioning(self, batch_size, seq_len):
+        return self.blank_conditioning.weight[:seq_len].repeat(batch_size, 1, 1)
+
+    def forward(self, text, pad_to_length=None):
+        kwargs = {"padding": "max_length"} if pad_to_length is not None else {}
 
         batch_encoding = self.tokenizer(
             text,
             truncation=True,
-            max_length=self.max_length,
+            max_length=pad_to_length or self.max_length,
             padding=True,
             return_tensors="pt",
             **kwargs,

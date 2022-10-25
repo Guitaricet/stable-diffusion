@@ -155,19 +155,7 @@ class LatentDiffusion(DDPM):
         denoise_grid = make_grid(denoise_grid, nrow=n_imgs_per_row)
         return denoise_grid
 
-    def get_first_stage_encoding(self, encoder_posterior, dtype=torch.float32):
-        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
-            z = encoder_posterior.sample().to(dtype)
-        elif isinstance(encoder_posterior, torch.Tensor):
-            z = encoder_posterior.to(dtype)
-        else:
-            raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
-        return self.scale_factor * z
-
-    def get_unconditional_conditioning(self, num_conditionings):
-        return self.cond_stage_model(num_conditionings * [""], pad_to_max_len=True)
-
-    def get_learned_conditioning(self, conditioning):
+    def get_learned_conditioning(self, conditioning, pad_to_max_len=None):
         if self.cond_stage_forward is None:
             if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
                 conditioning = self.cond_stage_model.encode(conditioning)
@@ -177,6 +165,7 @@ class LatentDiffusion(DDPM):
                 conditioning = self.cond_stage_model(conditioning)
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
+            assert isinstance(self.cond_stage_model, FrozenCLIPEmbedder), "you need to implement the pad_to_max_len thing for hug embedders"
             conditioning = getattr(self.cond_stage_model, self.cond_stage_forward)(conditioning)
         return conditioning
 
@@ -475,6 +464,23 @@ class LatentDiffusion(DDPM):
                 return self.first_stage_model.encode(x)
         else:
             return self.first_stage_model.encode(x)
+
+    def get_first_stage_encoding(self, encoder_posterior, dtype=torch.float32):
+        if isinstance(encoder_posterior, DiagonalGaussianDistribution):
+            z = encoder_posterior.sample().to(dtype)
+        elif isinstance(encoder_posterior, torch.Tensor):
+            z = encoder_posterior.to(dtype)
+        else:
+            raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
+        return self.scale_factor * z
+
+    def get_unconditional_conditioning(self, num_conditionings, seq_len=None):
+        if isinstance(self.cond_stage_model, FrozenCLIPEmbedder):
+            return self.cond_stage_model(num_conditionings * [""])
+        
+        if seq_len is None:
+            raise ValueError("seq_len must be specified for non-CLIP conditioning")
+        return self.cond_stage_model(num_conditionings * [""], pad_to_length=seq_len)
 
     def shared_step(self, batch, **kwargs):
         x, c = self.get_input(batch, self.first_stage_key)
