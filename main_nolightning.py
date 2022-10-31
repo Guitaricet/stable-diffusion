@@ -266,7 +266,7 @@ if __name__ == "__main__":
         model = instantiate_from_config(config.model)
 
     if args.train_only_adapters:
-        adapter_parameters = [p for n, p in model.named_parameters() if "adapter" in n]
+        adapter_parameters = [p for n, p in model.named_parameters() if "adapter" in n or "out_normalization" in n]
         blank_conditioning_parameters = [p for n, p in model.named_parameters() if "blank_conditioning" in n]
         lora_parameters = [p for n, p in model.named_parameters() if "lora" in n]
 
@@ -277,8 +277,8 @@ if __name__ == "__main__":
     else:
         trainable_parameters = [p for p in model.parameters() if p.requires_grad]
 
-    logger.info(f"Number of model parameters    : {param_count(model.parameters()) // 1e6}M")
-    logger.info(f"Number of trainable parameters: {param_count(trainable_parameters) / 1e6}M")
+    logger.info(f"Number of model parameters    : {param_count(model.parameters()) / 1e6:.2f}M")
+    logger.info(f"Number of trainable parameters: {param_count(trainable_parameters) / 1e6:.2f}M")
     optimizer = torch.optim.Adam(trainable_parameters, lr=config.deepspeed.optimizer.params.lr)
 
     model, optimizer, _, _ = deepspeed.initialize(

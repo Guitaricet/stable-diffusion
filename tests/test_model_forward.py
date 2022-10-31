@@ -3,7 +3,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.models.diffusion.latent_diffusion import LatentDiffusion
 
 
 def test_model_forward():
@@ -18,7 +18,3 @@ def test_model_forward():
     x = torch.randn(batch_size, 4, 64, 64)
 
     out = model.forward(x, conditioning)
-
-
-if __name__ == "__main__":
-    test_model_forward()

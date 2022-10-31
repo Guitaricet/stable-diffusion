@@ -4,7 +4,7 @@ import torch
 from omegaconf import OmegaConf
 
 from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.models.diffusion.latent_diffusion import LatentDiffusion
 
 
 def test_model_get_input():
@@ -22,7 +22,3 @@ def test_model_get_input():
 
     batch = {"image": x, "caption": conditioning}
     out = model.get_input(batch, "image")
-
-
-# if __name__ == "__main__":
-#     test_model_get_input()

@@ -1,15 +1,32 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModel
 
+from loguru import logger
+
 
 class FrozenHugEmbedderWithAdapter(nn.Module):
-    def __init__(self, model_name, max_length, output_dim, **model_kwargs):
+    def __init__(self, model_name, max_length, output_dim, feature_layer_index=-1, output_layer_norm=False, **model_kwargs):
         super().__init__()
         # how to load just the encoder of t5?
+        self.feature_layer_index = feature_layer_index
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        if "load_in_8bit" in model_kwargs:
+            gpu_index = os.environ["LOCAL_RANK"]
+            logger.info(f"Using 8-bit model. Rank: {gpu_index}")
+
+            device_map = {'': int(gpu_index)}  # put everything on the same device
+            if "device_map" in model_kwargs:
+                device_map = model_kwargs["device_map"]
+
+            logger.info(f"Device map: {device_map}")
+            model_kwargs["device_map"] = device_map
+
         self.transformer = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.freeze()  # freeze the transformer
 
@@ -28,6 +45,11 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
             nn.SiLU(),  # SiLU(x) = Swish(x) = x * sigmoid(x)
             nn.Linear(4 * transformer_hidden, output_dim),
         ) # only the adapter is trainable
+        # Add LayerNorm and set gamma and beta to values from CLIP
+
+        self.out_normalization = nn.Identity()
+        if output_layer_norm:
+            self.out_normalization = nn.LayerNorm(output_dim)
 
         self.model_name = model_name
         self.max_length = max_length
@@ -46,18 +68,20 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         return self.blank_conditioning.weight[:seq_len].repeat(batch_size, 1, 1)
 
     def forward(self, text, pad_to_length=None):
-        kwargs = {"padding": "max_length"} if pad_to_length is not None else {}
+        kwargs = {"padding": "max_length" if pad_to_length is not None else True}
 
         batch_encoding = self.tokenizer(
             text,
             truncation=True,
             max_length=pad_to_length or self.max_length,
-            padding=True,
             return_tensors="pt",
             **kwargs,
         )
         batch_encoding = batch_encoding.to(self.device)
-        outputs = self.transformer(**batch_encoding)
+        outputs = self.transformer(**batch_encoding, output_hidden_states=True)
 
-        z = outputs.last_hidden_state
-        return self.adapter(z)
+        z = outputs.hidden_states[self.feature_layer_index]
+        z = self.adapter(z)
+        z = self.out_normalization(z)
+
+        return z
