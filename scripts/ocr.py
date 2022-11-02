@@ -1,10 +1,10 @@
 """Perform OCR on images, check if ocr'ed text is close to caption, if no delete image if yes move to the dataset folder
 
 python scripts/ocr.py \
-    --input_dir "/home/vladislavlialin/data/text-laion-20M-images" \
-    --output_dir "/home/vladislavlialin/data/text-laion-20M-images-with-text" \
-    --start_shard 100 \
-    --num_shards 100
+    --input_dir "/home/vlialin/data/text-laion-20M-images" \
+    --output_dir "/home/vlialin/data/text-laion-20M-images-with-text" \
+    --start_shard 21 \
+    --num_shards 78
 """
 import argparse
 import time
@@ -84,43 +84,45 @@ def process_shard(shard_dir, shard_output_dir):
             with open(image_meta_path, "r") as f:
                 image_meta = json.load(f)
 
+            caption = image_meta["caption"]
+
+            if caption is None or caption == "": # happens a few times in the dataset
+                os.remove(image_path)
+                os.remove(image_meta_path)
+                continue
+
+            caption = caption.lower()
+
             ocr_output = reader.readtext(
                 image_path,
-                batch_size=64,  # maximizes speed in our experiments (3090)
+                batch_size=64,  # maximizes speed in our experiments (RTX 3090)
             )
 
+            all_image_text = ""
             for ocr_item in ocr_output:
                 ocr_confidence = ocr_item[2]
-                if ocr_confidence < 0.7:
+                if ocr_confidence < 0.5:
                     continue
 
                 ocr_text = ocr_item[1].lower()
-                item_text = image_meta["caption"]
+                all_image_text += ocr_text + " "
 
-                if item_text is None: # happens a few times in a dataset
-                    break
+            # compute how many char n-grams (up to 4) are in common
+            # between ocr'ed text and caption
+            similarity = chrf.compute(predictions=[all_image_text], references=[caption], beta=0, char_order=4, word_order=0)["score"]
+            if caption is not None and similarity > 0.9:  # very weak filtering, just to remove absolute trash
+                # move image to the dataset folder
+                n_images_with_ocr += 1
+                subfolder_images_with_ocr += 1
+                os.rename(image_path, os.path.join(shard_output_dir, os.path.basename(image_path)))
 
-                item_text = item_text.lower()
+                image_meta["ocr"] = ocr_output  # first versions of the dataset (before Oct 8 2022) don't have this field
+                image_meta["ocap"] = similarity
+                with os.path.join(shard_output_dir, os.path.basename(image_meta_path)) as f:
+                    json.dump(image_meta, f)
 
-                # compute how many char n-grams (up to 4) are in common
-                # between ocr'ed text and caption
-
-                similarity = chrf.compute(predictions=[ocr_text], references=[item_text])["score"]
-                if similarity > 0.9:
-                    # move image to the dataset folder
-                    n_images_with_ocr += 1
-                    subfolder_images_with_ocr += 1
-                    os.rename(image_path, os.path.join(shard_output_dir, os.path.basename(image_path)))
-
-                    image_meta["ocr"] = ocr_output  # first versions of the dataset (before Oct 8 2022) don't have this field
-                    with os.path.join(shard_output_dir, os.path.basename(image_meta_path)) as f:
-                        json.dump(image_meta, f)
-
-                    break
-            else:
-                # delete image
-                os.remove(image_path)
-                os.remove(image_meta_path)
+            if os.path.exists(image_path): os.remove(image_path)
+            os.remove(image_meta_path)
 
         hours = (time.time() - subfolder_start_time) / 3600
         print(f"Processed {subfolder} in {hours:.2f} hours")

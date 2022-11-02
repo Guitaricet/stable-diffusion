@@ -6,15 +6,8 @@ python scripts/download_laion_sharded.py \
     --input_dir "/home/vlialin/data/text-laion-20M" \
     --output_dir "/home/vlialin/data/text-laion-20M-images" \
     --shard_size 100000 \
-    --start_shard 14 \
-    --num_shards 10 \
-
-python scripts/download_laion_sharded.py \
-    --input_dir "/home/vladislavlialin/data/text-laion-20M" \
-    --output_dir "/home/vladislavlialin/data/text-laion-20M-images" \
-    --shard_size 100000 \
-    --start_shard 50 \
-    --num_shards 100 \
+    --start_shard 21 \
+    --num_shards 50 \
 
 """
 
@@ -77,9 +70,10 @@ def main(args):
             resize_mode="keep_ratio",
             output_folder=os.path.join(args.output_dir, f"shard_{shard_idx_str}"),
             output_format="files",
-            enable_wandb=True,
+            enable_wandb=False,
             number_sample_per_shard=1000,
             distributor="multiprocessing",
+            retries=2,
         )
 
         shard_proc_mins = (time.time() - shard_start_time) / 60
