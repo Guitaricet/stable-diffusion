@@ -64,8 +64,9 @@ model:
         model_name: "facebook/opt-6.7b"
         max_length: 128  # default value from FrozenCLIPEmbedder
         output_dim: 768
-        load_in_int8: True
-        device_map: auto
+        load_in_8bit: True
+        output_layer_norm: True
+        feature_layer_index: -2
 data:
   target: main.DataModuleFromConfig
   params:
@@ -84,9 +85,9 @@ data:
         set: val
 
 deepspeed:
-  # train_batch_size: 96 # total batch size across all gpus
-  train_micro_batch_size_per_gpu: 6  # it's easier to max out the gpu memory if we use control per-gpu batch size
-  gradient_accumulation_steps: 11
+  # train_batch_size: 256 # total batch size across all gpus
+  train_micro_batch_size_per_gpu: 4  # it's easier to max out the gpu memory if we use control per-gpu batch size
+  gradient_accumulation_steps: 64
   optimizer:
     type: Adam
     params:
@@ -96,7 +97,7 @@ deepspeed:
     params:
       warmup_type: linear
       warmup_min_lr: 1e-6
-      warmup_max_lr: 3.0e-04
+      warmup_max_lr: 1.0e-04
       warmup_num_steps: 500
   bf16:
     enabled: True

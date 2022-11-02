@@ -37,6 +37,7 @@ from ldm.models.diffusion.plms_sampler import PLMSSampler
 from ldm.metrics.clip_score import CLIPScore
 from ldm.metrics.fid import compute_fid
 from ldm.modules.encoders.modules import FrozenCLIPEmbedder
+from ldm.metrics.ocap import CraftOCap
 
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()
@@ -221,6 +222,18 @@ def generate_images(*, sampler, model, prompts, diffusion_steps, target_shape, g
         return generated_images
 
 
+def get_update2param_ratio(model, lr):
+    # https://youtu.be/P6sfmUTpUmc?t=6080
+    ratios_dict = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad: continue
+        update = lr * param.grad.std()  # not really true for Adam
+        param = param.data.std()
+        ratios_dict[name] = update / param
+
+    return ratios_dict
+
+
 if __name__ == "__main__":
     DEVICE = "cuda"
 
@@ -298,13 +311,15 @@ if __name__ == "__main__":
     # convert model inputs to dtype
     model.set_data_dtype(dtype)
     clip_score = CLIPScore(device=DEVICE, dtype=dtype, distributed=False)  # compute them independently on different GPUs, then gather and average
+    craft_ocap = CraftOCap(use_gpu=torch.cuda.is_available())
 
     if global_rank == 0:
         config_dict = OmegaConf.to_container(config, resolve=True)
         wandb.init(
             project=args.project,
-            config={**config_dict, **vars(args)},
+            config={**config_dict, **vars(args), "ocap_signature": craft_ocap.signature},
         )
+        wandb.watch(model.module, log="gradients", log_freq=10_000)
         # save config files
         for config_path in args.base:
             wandb.save(config_path, policy="now")
@@ -359,6 +374,7 @@ if __name__ == "__main__":
     examples_seen = 0
     logged_real_images = False
     start_time = time.time()
+    images_to_log = 12
 
     for epoch in range(args.max_epochs):
         logger.info(f"Starting epoch {epoch + 1} / {args.max_epochs}")
@@ -386,8 +402,15 @@ if __name__ == "__main__":
             loss, loss_dict = model(x, c, pad_to_max_len=pad_to_max_len)
 
             model.backward(loss)
-            # model.cond_stage_model.blank_conditioning.grad
-            # import remote_pdb; remote_pdb.set_trace()
+
+            if global_step % 1000 == 0:
+                logger.info("Computing update2param ratios...")
+                _u2p_time = time.time()
+                update2param_ratio = get_update2param_ratio(model)
+                wandb.log(update2param_ratio, step=global_step, commit=False)
+                _u2p_time = time.time() - _u2p_time
+                if _u2p_time > 1:
+                    logger.warning(f"Computing update2param ratios took {_u2p_time:.1f} seconds")
 
             model.step()
 
@@ -419,7 +442,8 @@ if __name__ == "__main__":
                 all_prompts = [] if global_rank == 0 else None
 
                 for i, val_batch in enumerate(val_loader):
-                    if i > 0: break  # only 1 batch
+                    if len(all_generated_images) >= images_to_log:
+                        break
 
                     prompts = val_batch[model.cond_stage_key]
                     prompts_gathered = gather_object(prompts)
@@ -471,7 +495,7 @@ if __name__ == "__main__":
                         images_log = [wandb.Image(im, caption=p) for im, p in zip(log_real_images, log_prompts)]
                         wandb.log({"val/real_images": images_log}, step=global_step)
 
-                logged_real_images = True  # notice that it is outsize of the if global_rank == 0
+                logged_real_images = True  # notice that it has to be outsize of the `if global_rank == 0` block
 
                 # Now he same, but with a single generation per prompt and CLIP/FID scores
                 all_generated_images = []
@@ -521,6 +545,9 @@ if __name__ == "__main__":
                 assert len(all_real_images) == batch_size * n_val_batches
                 assert all_real_images[0].shape == (512, 512, 3), all_real_images[0].shape
 
+                logger.info("Computing OCAP scores")
+                ocap_score_value = craft_ocap.compute(captions=all_prompts, images=all_generated_images)
+
                 all_real_images = np.transpose(all_real_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
                 all_generated_images = np.transpose(all_generated_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
                 fid_score_value = compute_fid(all_real_images, all_generated_images, batch_size=args.clip_score_batch_size)  # doesn't support distirubted
@@ -540,7 +567,6 @@ if __name__ == "__main__":
                     wandb.log({
                         "val/clip_score": clip_score_value,
                         "val/fid": fid_score_value,
-                        "val/harmonic_mean": 2 * (clip_score_value * fid_score_value) / (clip_score_value + fid_score_value),
                         },
                         step=global_step,
                     )
