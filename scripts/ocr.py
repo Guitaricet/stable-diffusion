@@ -74,14 +74,19 @@ def process_shard(shard_dir, shard_output_dir):
     _shard_start_time = time.time()
     no_meta_count = 0
     n_images_with_ocr = 0
+    total_images_processed = 0
     all_subfolders = sorted(glob(os.path.join(shard_dir, "*")))
-    for subfolder in tqdm(all_subfolders, desc="subfolders"):
+
+    pbar = tqdm(all_subfolders)
+    for subfolder in pbar:
         # check if subfolder is actualy a folder
         if not os.path.isdir(subfolder):
             continue
+        if total_images_processed > 0:
+            # update progress bar description
+            images_per_second = total_images_processed / (time.time() - _shard_start_time)
+            pbar.set_description(f"Processed {total_images_processed} images, {images_per_second:.2f} images/s")
 
-        logger.info(f"\tProcessing subfolder {subfolder}")
-        subfolder_start_time = time.time()
         subfolder_images_with_ocr = 0
         num_subfolder_images = len(glob(os.path.join(subfolder, "*.jpg")))
         for image_path in glob(f"{subfolder}/*.jpg"):
@@ -143,8 +148,7 @@ def process_shard(shard_dir, shard_output_dir):
 
             if os.path.exists(image_path): os.remove(image_path)
             os.remove(image_meta_path)
-
-        hours = (time.time() - subfolder_start_time) / 3600
+            total_images_processed += 1
 
     minutes = (time.time() - _shard_start_time) / 60
     images_per_second = num_subfolder_images / (minutes * 60)
