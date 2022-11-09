@@ -5,6 +5,18 @@ deepspeed main_nolightning.py \
     --max_epochs 1 \
     --eval_every 10 \
     --train_only_adapters \
+
+deepspeed main_nolightning.py \
+    --base configs/stable-diffusion/v1-finetune-textycaps-t5-11b-lora.yaml \
+    --actual_resume checkpoints/stable-diffusion-v-1-4-original/sd-v1-4.ckpt \
+    --max_epochs 2 \
+    --eval_every 10000 \
+    --eval_diffusion_steps 50 \
+    --save_every 10000 \
+    --conditioning_drop 0.1 \
+    --train_only_adapters \
+    --wait_on_rank_when_loading_model 220 \
+
 """
 
 import argparse, os, datetime, time
@@ -31,13 +43,11 @@ from loguru import logger
 from tqdm import tqdm
 
 from ldm.util import instantiate_from_config
+from ldm.metrics import CLIPScore, compute_fid, CraftOCap
+from ldm.models.diffusion import DDIMSampler, PLMSSampler
 from ldm.models.diffusion.latent_diffusion import LatentDiffusion
-from ldm.models.diffusion.ddim_sampler import DDIMSampler
-from ldm.models.diffusion.plms_sampler import PLMSSampler
-from ldm.metrics.clip_score import CLIPScore
-from ldm.metrics.fid import compute_fid
 from ldm.modules.encoders.modules import FrozenCLIPEmbedder
-from ldm.metrics.ocap import CraftOCap
+from ldm.data.webdataset import TextyCapsWebdataset
 
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()
@@ -82,6 +92,7 @@ def parse_args(**parser_kwargs):
     parser.add_argument("-n", "--name", type=str, const=True, default="", nargs="?", help="postfix for logdir")
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
     parser.add_argument("--project", type=str, default="stable_diffusion_text", help="wandb project name")
+    parser.add_argument("--wait_on_rank_when_loading_model", type=int, default=None, help="Wait this many seconds on each rank when loading model. Reduces peak CPU memory usage.")
     args = parser.parse_args()
     return args
 
@@ -234,6 +245,34 @@ def get_update2param_ratio(model, lr):
     return ratios_dict
 
 
+def get_dataloader(dataset_config, num_workers, batch_size, shuffle, is_webdataset):
+    if is_webdataset:
+        if dataset_config.params.batch_size != batch_size:
+            raise ValueError("batch_size in dataset config must be equal to batch_size in dataloader config")
+        if shuffle != dataset_config.params.shuffle:
+            raise ValueError("shuffle in dataset config must be equal to shuffle in dataloader config")
+
+    dataset = instantiate_from_config(dataset_config)
+    if isinstance(dataset, ldm.data.webdataset.TextyCapsWebdataset):
+        dataset = dataset.get_dataset()
+        batch_size = None
+        sampler = None
+    else:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            shuffle=shuffle,
+        )
+
+    loader = DataLoader(
+        dataset,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        pin_memory=True,
+        sampler=sampler,
+    )
+    return loader
+
+
 if __name__ == "__main__":
     DEVICE = "cuda"
 
@@ -273,10 +312,21 @@ if __name__ == "__main__":
         logger.info("Using LORA")
         config.model.params.unet_config.params.use_lora = True
 
+    if args.wait_on_rank_when_loading_model:
+        # wait for global_rank * N seconds before loading model
+        # this allows to use less CPU memory at ones
+        _wait = global_rank * args.wait_on_rank_when_loading_model
+        print(f"Rank {global_rank} waiting {_wait} seconds before loading model")
+        time.sleep(_wait)
+        print(f"Rank {global_rank} done waiting")
+
     if args.actual_resume:
         model = load_model_from_config(config, args.actual_resume)
     else:
         model = instantiate_from_config(config.model)
+
+    print(f"Rank {global_rank} loaded model")
+    dist.barrier()
 
     if args.train_only_adapters:
         adapter_parameters = [p for n, p in model.named_parameters() if "adapter" in n or "out_normalization" in n]
@@ -328,25 +378,17 @@ if __name__ == "__main__":
     val_dataset = instantiate_from_config(config.data.params.val)
 
     batch_size = int(model.config["train_micro_batch_size_per_gpu"])
-    train_loader = DataLoader(
-        train_dataset,
-        num_workers=config.data.params.num_workers,
+    train_loader = get_dataloader(
+        dataset_config=config.data.params.train,
         batch_size=batch_size,
-        pin_memory=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            shuffle=True,
-        ),
+        shuffle=True,
+        num_workers=config.data.params.num_workers,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        num_workers=config.data.params.num_workers,
+    val_loader = get_dataloader(
+        dataset_config=config.data.params.val,
         batch_size=batch_size,
-        pin_memory=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(
-            val_dataset,
-            shuffle=False,
-        ),
+        shuffle=False,
+        num_workers=config.data.params.num_workers,
     )
 
     val_diffusion_steps = args.eval_diffusion_steps
@@ -406,7 +448,7 @@ if __name__ == "__main__":
             if global_step % 1000 == 0:
                 logger.info("Computing update2param ratios...")
                 _u2p_time = time.time()
-                update2param_ratio = get_update2param_ratio(model)
+                update2param_ratio = get_update2param_ratio(model, lr=optimizer.param_groups[0]["lr"])
                 wandb.log(update2param_ratio, step=global_step, commit=False)
                 _u2p_time = time.time() - _u2p_time
                 if _u2p_time > 1:

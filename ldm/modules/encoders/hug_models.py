@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModel
 
+from ..encoders.t5_encoder import T5EncoderModel
+
 from loguru import logger
 
 
@@ -27,7 +29,14 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
             logger.info(f"Device map: {device_map}")
             model_kwargs["device_map"] = device_map
 
-        self.transformer = AutoModel.from_pretrained(model_name, **model_kwargs)
+        if "t5-" in model_name:
+            logger.info("Using T5 encoder via ldm.modules.t5_encoder.T5EncoderModel (no decoder)")
+            self.transformer = T5EncoderModel.from_pretrained(model_name, **model_kwargs)
+            logger.info("T5 encoder loaded")
+            logger.info(f"Memory usage: {torch.cuda.memory_allocated() / 1024 / 1024} MB")
+        else:
+            self.transformer = AutoModel.from_pretrained(model_name, **model_kwargs)
+
         self.freeze()  # freeze the transformer
 
         if hasattr(self.transformer.config, "d_model"):
@@ -47,9 +56,10 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         ) # only the adapter is trainable
         # Add LayerNorm and set gamma and beta to values from CLIP
 
-        self.out_normalization = nn.Identity()
-        if output_layer_norm:
-            self.out_normalization = nn.LayerNorm(output_dim)
+        if not output_layer_norm:
+            raise RuntimeError("You should always use LayerNorm for FrozenHugEmbedderWithAdapter")
+            
+        self.out_normalization = nn.LayerNorm(output_dim)
 
         self.model_name = model_name
         self.max_length = max_length
