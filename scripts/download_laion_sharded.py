@@ -9,6 +9,13 @@ python scripts/download_laion_sharded.py \
     --start_shard 21 \
     --num_shards 50 \
 
+python scripts/download_laion_sharded.py \
+    --input_dir "/home/vlialin/data/laion-filtered" \
+    --output_dir "/home/vlialin/data/texty-caps" \
+    --shard_size 100000 \
+    --start_shard 0 \
+    --num_shards 1000 \
+    --num_processes 6 \
 """
 
 import argparse
@@ -26,24 +33,19 @@ def make_args():
     parser.add_argument("--shard_size", type=int, default=100_000)
     parser.add_argument("--start_shard", type=int, default=0)
     parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument("--num_processes", type=int, default=8)
 
     return parser.parse_args()
 
 
 def main(args):
-    # How to prepare data:
-    # dataset = load_dataset("laion/laion2B-en-joined", split="train", streaming=True)
-    # dataset = dataset.shuffle(seed=84, buffer_size=10_000)
-    # dataset = dataset.take(20_000_000)
-    # dataset = dataset.filter(lambda x:
-    #     x["punsafe"] is not None and \
-    #     x["punsafe"] < 0.5 and \
-    #     x["pwatermark"] is not None and \
-    #     x["pwatermark"] < 0.5
-    # )
+    # to prepare data: scripts/filter_laion.py
 
     script_start_time = time.time()
+    print(f"Loading dataset from {args.input_dir}")
+    _time = time.time()
     dataset = load_from_disk(args.input_dir)
+    print(f"Loaded dataset in {time.time() - _time:.2f} seconds")
 
     for shard_idx in range(args.start_shard, args.start_shard + args.num_shards):
         shard_start_time = time.time()
@@ -59,7 +61,7 @@ def main(args):
         shard_idx_str = str(shard_idx).zfill(6)
 
         download(
-            processes_count=16,
+            processes_count=args.num_processes,
             thread_count=32,
             url_list="tmp.parquet",
             input_format="parquet",
@@ -73,7 +75,6 @@ def main(args):
             enable_wandb=False,
             number_sample_per_shard=1000,
             distributor="multiprocessing",
-            retries=2,
         )
 
         shard_proc_mins = (time.time() - shard_start_time) / 60
