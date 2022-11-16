@@ -78,6 +78,7 @@ def process_shard(shard_dir, shard_output_dir):
     all_subfolders = sorted(glob(os.path.join(shard_dir, "*")))
 
     pbar = tqdm(all_subfolders)
+    num_subfolder_images = 0
     for subfolder in pbar:
         # check if subfolder is actualy a folder
         if not os.path.isdir(subfolder):
@@ -97,6 +98,7 @@ def process_shard(shard_dir, shard_output_dir):
             image_name = os.path.basename(image_path).split(".")[0]
 
             image_meta_path = os.path.join(subfolder, f"{image_name}.json")
+            txt_meta_path = os.path.join(subfolder, f"{image_name}.txt")
             if not os.path.exists(image_meta_path):
                 logger.warning(f"\t\tNo meta file for image {image_path}")
                 no_meta_count += 1
@@ -110,6 +112,8 @@ def process_shard(shard_dir, shard_output_dir):
             if caption is None or caption == "": # happens a few times in the dataset
                 os.remove(image_path)
                 os.remove(image_meta_path)
+                if os.path.exists(txt_meta_path):
+                    os.remove(txt_meta_path)
                 continue
 
             caption = caption.lower()
@@ -148,6 +152,9 @@ def process_shard(shard_dir, shard_output_dir):
 
             if os.path.exists(image_path): os.remove(image_path)
             os.remove(image_meta_path)
+            if os.path.exists(txt_meta_path):
+                os.remove(txt_meta_path)
+
             total_images_processed += 1
 
     minutes = (time.time() - _shard_start_time) / 60

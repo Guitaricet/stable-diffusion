@@ -5,21 +5,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import AutoTokenizer, AutoModel
+from loguru import logger
 
 from ..encoders.t5_encoder import T5EncoderModel
-
-from loguru import logger
+from ...dist_utils import get_rank
 
 
 class FrozenHugEmbedderWithAdapter(nn.Module):
-    def __init__(self, model_name, max_length, output_dim, feature_layer_index=-1, output_layer_norm=False, **model_kwargs):
+    def __init__(self, model_name, max_length, output_dim, feature_layer_index=-1, output_layer_norm=False, tokenizer_name=None, **model_kwargs):
         super().__init__()
-        # how to load just the encoder of t5?
-        self.feature_layer_index = feature_layer_index
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer_name = tokenizer_name or model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
         if "load_in_8bit" in model_kwargs:
-            gpu_index = os.environ["LOCAL_RANK"]
+            gpu_index = get_rank() % torch.cuda.device_count()
+            if "LOCAL_RANK" in os.environ:
+                assert int(os.environ["LOCAL_RANK"]) == gpu_index
+
             logger.info(f"Using 8-bit model. Rank: {gpu_index}")
 
             device_map = {'': int(gpu_index)}  # put everything on the same device
@@ -64,6 +66,7 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         self.model_name = model_name
         self.max_length = max_length
         self.output_dim = output_dim
+        self.feature_layer_index = feature_layer_index
 
     @property
     def device(self):
@@ -91,6 +94,11 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
         outputs = self.transformer(**batch_encoding, output_hidden_states=True)
 
         z = outputs.hidden_states[self.feature_layer_index]
+
+        if z.dtype != self.adapter[0].weight.dtype:
+            # when using int8, we get fp16 output and need to cast it to the dtype we're training in
+            z = z.to(self.adapter[0].weight.dtype)
+
         z = self.adapter(z)
         z = self.out_normalization(z)
 

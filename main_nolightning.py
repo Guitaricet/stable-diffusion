@@ -13,9 +13,17 @@ deepspeed main_nolightning.py \
     --eval_every 10000 \
     --eval_diffusion_steps 50 \
     --save_every 10000 \
-    --conditioning_drop 0.1 \
     --train_only_adapters \
+    --conditioning_drop 0.1 \
     --wait_on_rank_when_loading_model 220 \
+
+
+deepspeed main_nolightning.py \
+    --base configs/stable-diffusion/webdataset-finetune-textycaps-opt6b-lora.yaml \
+    --actual_resume checkpoints/stable-diffusion-v-1-4-original/sd-v1-4.ckpt \
+    --max_epochs 2 \
+    --eval_every 10 \
+    --train_only_adapters \
 
 """
 
@@ -42,6 +50,7 @@ from einops import rearrange, repeat
 from loguru import logger
 from tqdm import tqdm
 
+from ldm import dist_utils
 from ldm.util import instantiate_from_config
 from ldm.metrics import CLIPScore, compute_fid, CraftOCap
 from ldm.models.diffusion import DDIMSampler, PLMSSampler
@@ -85,6 +94,7 @@ def parse_args(**parser_kwargs):
     parser.add_argument("--pmls", type=str2bool, default=True, help="Use PMLS diffusion scheduler. If False, use DDIM")
     parser.add_argument("--clip_score_batch_size", type=int, default=32, help="Batch size for CLIP score evaluation")
     parser.add_argument("--eval_diffusion_steps", type=int, default=50, help="Number of diffusion steps used for image generation during evaluation")
+    parser.add_argument("--validation_batches", type=int, default=50, help="Number of batches to use for validation")
 
     # Misc
     parser.add_argument( "-l", "--logdir", type=str, default="logs", help="logging directory")
@@ -93,6 +103,7 @@ def parse_args(**parser_kwargs):
     parser.add_argument("--local_rank", type=int, default=0, help="local rank for distributed training")
     parser.add_argument("--project", type=str, default="stable_diffusion_text", help="wandb project name")
     parser.add_argument("--wait_on_rank_when_loading_model", type=int, default=None, help="Wait this many seconds on each rank when loading model. Reduces peak CPU memory usage.")
+    parser.add_argument("--distributed", default=True, type=str2bool, nargs="?", const=True)
     args = parser.parse_args()
     return args
 
@@ -131,36 +142,26 @@ def postprocess_image(image):
     return image
 
 
-def gather_tensor(x: torch.Tensor):
-    gather_list = None
-    if dist.get_rank() == 0:
-        gather_list = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
-    dist.gather(x, gather_list=gather_list, dst=0)
+def unwrap_model(model):
+    if isinstance(model, (torch.nn.parallel.DistributedDataParallel, deepspeed.DeepSpeedEngine)):
+        model = model.module
+    return model
 
-    if dist.get_rank() == 0:
-        return torch.cat(gather_list, dim=0)
+def get_dtype(model, config):
+    dtype = torch.float32
+    if isinstance(model, deepspeed.DeepSpeedEngine):
+        if model.bfloat16_enabled():
+            dtype = torch.bfloat16
+        if model.fp16_enabled():
+            dtype = torch.float16
+        return dtype
 
+    if config.deepspeed.bf16.enabled:
+        return torch.bfloat16
+    if config.deepspeed.fp16.enabled:  # is it how it's called? Just don't use fp16, it's bad for this model
+        return torch.float16
 
-def gather_object(x):
-    gather_list = None
-    if dist.get_rank() == 0:
-        gather_list = [None for _ in range(dist.get_world_size())]
-    
-    dist.gather_object(x, object_gather_list=gather_list, dst=0)
-
-    if dist.get_rank() == 0:
-        if isinstance(gather_list[0], list):
-            return [item for sublist in gather_list for item in sublist]
-        return gather_list
-
-
-def all_gather_object(x):
-    gather_list = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(obj=x, object_list=gather_list)
-
-    gather_list = [item for sublist in gather_list for item in sublist]
-    return gather_list
-
+    return dtype
 
 @torch.no_grad()
 def generate_images_grid(*, sampler, model, prompts, images_per_prompt, diffusion_steps, target_shape, guidance_scale, eta, start_code):
@@ -193,9 +194,9 @@ def generate_images_grid(*, sampler, model, prompts, images_per_prompt, diffusio
         generated_images.append(_generated_images)
 
     generated_images = torch.stack(generated_images, dim=0)  # [batch_size, 3, 512, 512 * batch_size]
-    generated_images = gather_tensor(generated_images)
+    generated_images = dist_utils.gather_tensor(generated_images)
 
-    if dist.get_rank() == 0:
+    if dist_utils.get_rank() == 0:
         generated_images = postprocess_image(generated_images)  # returns numpy array
         return generated_images
 
@@ -226,38 +227,42 @@ def generate_images(*, sampler, model, prompts, diffusion_steps, target_shape, g
         generated_images = postprocess_image(generated_images)
         return generated_images
 
-    generated_images = gather_tensor(generated_images)
+    generated_images = dist_utils.gather_tensor(generated_images)
 
-    if dist.get_rank() == 0:
+    if dist_utils.get_rank() == 0:
         generated_images = postprocess_image(generated_images)  # returns numpy array
         return generated_images
 
 
-def get_update2param_ratio(model, lr):
+def get_update2param_ratio(model, lr, trainable_parameters_names):
     # https://youtu.be/P6sfmUTpUmc?t=6080
     ratios_dict = {}
     for name, param in model.named_parameters():
-        if not param.requires_grad: continue
+        if not name in trainable_parameters_names: continue
+        # if not param.requires_grad: continue
+        # if param.grad is None: continue  # TODO: why params requiring grad but not having grads and is it a problem? E.g., can we save memory by not storing them?
         update = lr * param.grad.std()  # not really true for Adam
         param = param.data.std()
         ratios_dict[name] = update / param
 
+    assert len(ratios_dict) > 0
     return ratios_dict
 
 
-def get_dataloader(dataset_config, num_workers, batch_size, shuffle, is_webdataset):
+def get_dataloader(dataset_config, num_workers, batch_size, shuffle, is_webdataset=False):
     if is_webdataset:
         if dataset_config.params.batch_size != batch_size:
             raise ValueError("batch_size in dataset config must be equal to batch_size in dataloader config")
         if shuffle != dataset_config.params.shuffle:
             raise ValueError("shuffle in dataset config must be equal to shuffle in dataloader config")
 
+    sampler = None
     dataset = instantiate_from_config(dataset_config)
-    if isinstance(dataset, ldm.data.webdataset.TextyCapsWebdataset):
+    if isinstance(dataset, TextyCapsWebdataset):
+        logger.info("Using Webdataset")
         dataset = dataset.get_dataset()
         batch_size = None
-        sampler = None
-    else:
+    elif dist_utils.is_distributed():
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset,
             shuffle=shuffle,
@@ -281,8 +286,11 @@ if __name__ == "__main__":
         # support torchrun
         args.local_rank = int(os.environ["LOCAL_RANK"])
 
-    deepspeed.init_distributed()
-    global_rank = dist.get_rank()
+    if args.distributed:
+        deepspeed.init_distributed()
+
+    global_rank = dist_utils.get_rank()
+    local_rank = dist_utils.get_rank() % torch.cuda.device_count()
 
     if global_rank != 0:
         logger.remove()
@@ -309,7 +317,7 @@ if __name__ == "__main__":
     deepspeed_config = OmegaConf.to_container(config.deepspeed, resolve=True)
 
     if args.lora or config.model.params.unet_config.params.use_lora:
-        logger.info("Using LORA")
+        logger.info("Using LoRa")
         config.model.params.unet_config.params.use_lora = True
 
     if args.wait_on_rank_when_loading_model:
@@ -326,8 +334,9 @@ if __name__ == "__main__":
         model = instantiate_from_config(config.model)
 
     print(f"Rank {global_rank} loaded model")
-    dist.barrier()
+    dist_utils.barrier()
 
+    trainable_parameter_names = []
     if args.train_only_adapters:
         adapter_parameters = [p for n, p in model.named_parameters() if "adapter" in n or "out_normalization" in n]
         blank_conditioning_parameters = [p for n, p in model.named_parameters() if "blank_conditioning" in n]
@@ -337,26 +346,30 @@ if __name__ == "__main__":
         logger.info(f"\tBlank conditioning parameters: {param_count(blank_conditioning_parameters) / 1e6:.2f}M")
         logger.info(f"\tLoRa parameters: {param_count(lora_parameters) / 1e6:.2f}M")
         trainable_parameters = adapter_parameters + blank_conditioning_parameters + lora_parameters
+        trainable_parameter_names = [n for n, p in model.named_parameters() if "adapter" in n or "out_normalization" in n or "blank_conditioning" in n or "lora" in n]
     else:
         trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+        trainable_parameter_names = [n for n, p in model.named_parameters() if p.requires_grad]
 
     logger.info(f"Number of model parameters    : {param_count(model.parameters()) / 1e6:.2f}M")
     logger.info(f"Number of trainable parameters: {param_count(trainable_parameters) / 1e6:.2f}M")
     optimizer = torch.optim.Adam(trainable_parameters, lr=config.deepspeed.optimizer.params.lr)
 
-    model, optimizer, _, _ = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        optimizer=optimizer,
-        config=deepspeed_config,
-    )
+    if args.distributed:
+        model, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            optimizer=optimizer,
+            config=deepspeed_config,
+        )
+
     model: Union[LatentDiffusion, deepspeed.DeepSpeedEngine]  # helps with type hinting
 
-    dtype = torch.float32
-    if model.bfloat16_enabled():
-        dtype = torch.bfloat16
-    if model.fp16_enabled():
-        dtype = torch.float16
+    dtype = get_dtype(model, config)
+
+    if not args.distributed:
+        # deepspeed handles device placement for us
+        model = model.to(DEVICE, dtype=dtype)
 
     # convert model inputs to dtype
     model.set_data_dtype(dtype)
@@ -369,7 +382,7 @@ if __name__ == "__main__":
             project=args.project,
             config={**config_dict, **vars(args), "ocap_signature": craft_ocap.signature},
         )
-        wandb.watch(model.module, log="gradients", log_freq=10_000)
+        wandb.watch(unwrap_model(model), log="gradients", log_freq=10_000)
         # save config files
         for config_path in args.base:
             wandb.save(config_path, policy="now")
@@ -377,7 +390,12 @@ if __name__ == "__main__":
     train_dataset = instantiate_from_config(config.data.params.train)
     val_dataset = instantiate_from_config(config.data.params.val)
 
-    batch_size = int(model.config["train_micro_batch_size_per_gpu"])
+    if args.distributed:
+        # more flexible when using DeepSpeed as we can configure train_batch_size (total batch size) instead
+        batch_size = int(model.config["train_micro_batch_size_per_gpu"])
+    else:
+        batch_size = config.deepspeed.train_micro_batch_size_per_gpu
+
     train_loader = get_dataloader(
         dataset_config=config.data.params.train,
         batch_size=batch_size,
@@ -396,7 +414,7 @@ if __name__ == "__main__":
         logger.warning(f"Using a small number of diffusion steps for evaluation: {val_diffusion_steps}")
 
     val_start_code = torch.randn([batch_size, 4, 512 // 8, 512 // 8], dtype=dtype, device=DEVICE)
-    val_sampler = PLMSSampler(model.module) if args.pmls else DDIMSampler(model.module)
+    val_sampler = PLMSSampler(unwrap_model(model)) if args.pmls else DDIMSampler(unwrap_model(model))
     val_guidance_scale = 7.5
     val_eta = 0.0  # has to be zero for PMLS
 
@@ -426,10 +444,14 @@ if __name__ == "__main__":
             x, c = model.get_input(batch, model.first_stage_key)  # no grad
             # x is [batch_size, 3, 512, 512]
             # c is list of srtings
+            assert isinstance(c, list)
+            assert isinstance(c[0], str)
 
+            conditioning_drop_mask = None
             if args.conditioning_drop > 0.0:
                 if not isinstance(model.cond_stage_model, FrozenCLIPEmbedder):
-                    raise NotImplementedError("Conditioning drop is only implemented for FrozenCLIPEmbedder")
+                    conditioning_drop_mask = torch.rand(len(c)) < args.conditioning_drop
+
                 # this trick will work with clip conditioning,
                 # because model is already aware of its representations
                 # and because it uses "" for blank conditioning
@@ -441,22 +463,22 @@ if __name__ == "__main__":
             if all([len(cc) == 0 for cc in c]):
                 pad_to_max_len = True
 
-            loss, loss_dict = model(x, c, pad_to_max_len=pad_to_max_len)
+            loss, loss_dict = model(x, c, pad_to_max_len=pad_to_max_len, conditioning_drop_mask=conditioning_drop_mask)
 
-            model.backward(loss)
+            if isinstance(model, deepspeed.DeepSpeedEngine):
+                model.backward(loss)
+            else:
+                loss.backward()
 
-            if global_step % 1000 == 0:
-                logger.info("Computing update2param ratios...")
-                _u2p_time = time.time()
-                update2param_ratio = get_update2param_ratio(model, lr=optimizer.param_groups[0]["lr"])
-                wandb.log(update2param_ratio, step=global_step, commit=False)
-                _u2p_time = time.time() - _u2p_time
-                if _u2p_time > 1:
-                    logger.warning(f"Computing update2param ratios took {_u2p_time:.1f} seconds")
+            if model.cond_stage_model.adapter[0].weight.grad is not None:
+                print(f"Rank {global_rank} has grad for adapter")
 
-            model.step()
+            if isinstance(model, deepspeed.DeepSpeedEngine):
+                model.step()
+            else:
+                optimizer.step()
 
-            examples_seen += batch_size * dist.get_world_size()
+            examples_seen += batch_size * dist_utils.get_world_size()
 
             if model.is_gradient_accumulation_boundary():
                 # it's important that this one is separate from the next if
@@ -482,13 +504,14 @@ if __name__ == "__main__":
                 all_generated_images = [] if global_rank == 0 else None
                 all_real_images = [] if global_rank == 0 else None
                 all_prompts = [] if global_rank == 0 else None
+                n_generated_images = 0
 
                 for i, val_batch in enumerate(val_loader):
-                    if len(all_generated_images) >= images_to_log:
+                    if n_generated_images >= images_to_log:
                         break
 
                     prompts = val_batch[model.cond_stage_key]
-                    prompts_gathered = gather_object(prompts)
+                    prompts_gathered = dist_utils.gather_object(prompts)
                     if global_rank == 0:
                         all_prompts.extend(prompts)
 
@@ -497,7 +520,7 @@ if __name__ == "__main__":
                         images = val_batch[model.first_stage_key]
                         images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
 
-                        images_gathered = gather_tensor(images)
+                        images_gathered = dist_utils.gather_tensor(images)
                         if global_rank == 0:
                             images_gathered = postprocess_image(images_gathered)
                             all_real_images.extend(images_gathered)
@@ -515,16 +538,17 @@ if __name__ == "__main__":
                             eta=val_eta,
                             start_code=val_start_code,
                         )
+                        n_generated_images += dist_utils.get_world_size()
 
                         if global_rank == 0:
-                            assert generated_images.shape[0] == batch_size * dist.get_world_size(), generated_images.shape
+                            assert generated_images.shape[0] == batch_size * dist_utils.get_world_size(), generated_images.shape
                             all_generated_images.append(generated_images)
                         else:
                             assert generated_images is None
 
                 # end of inference
                 if global_rank == 0:
-                    images_to_log = batch_size * dist.get_world_size()
+                    images_to_log = batch_size * dist_utils.get_world_size()
                     all_generated_images = np.concatenate(all_generated_images, axis=0)
                     log_generated_images = all_generated_images[:images_to_log]
                     log_prompts = all_prompts[:images_to_log]
@@ -544,19 +568,19 @@ if __name__ == "__main__":
                 all_real_images = []
                 all_prompts = []
 
-                n_val_batches = min(50, len(val_loader))
+                n_val_batches = min(args.validation_batches, len(val_loader))
                 _desc = f"Validation at step {global_step}, generating images for CLIP and FID scores"
-                for i, val_batch in enumerate(tqdm(val_loader, total=n_val_batches, desc=_desc, disable=global_rank != 0)):
-                    if i >= n_val_batches: break
-                    prompts = val_batch[model.cond_stage_key]
-                    all_prompts.extend(prompts)
+                with model.ema_scope():
+                    for i, val_batch in enumerate(tqdm(val_loader, total=n_val_batches, desc=_desc, disable=global_rank != 0)):
+                        if i >= n_val_batches: break
+                        prompts = val_batch[model.cond_stage_key]
+                        all_prompts.extend(prompts)
 
-                    images = val_batch[model.first_stage_key]
-                    images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
-                    images = postprocess_image(images)
-                    all_real_images.extend(images)
+                        images = val_batch[model.first_stage_key]
+                        images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
+                        images = postprocess_image(images)
+                        all_real_images.extend(images)
 
-                    with model.ema_scope():
                         # returns [batch_size, 512, 512, 3] numpy array
                         if i < len(val_loader):  # last batch might be truncated
                             assert len(prompts) == batch_size, (len(prompts), batch_size)
@@ -588,21 +612,22 @@ if __name__ == "__main__":
                 assert all_real_images[0].shape == (512, 512, 3), all_real_images[0].shape
 
                 logger.info("Computing OCAP scores")
-                ocap_score_value = craft_ocap.compute(captions=all_prompts, images=all_generated_images)
+                with torch.cuda(device=local_rank):
+                    ocap_score_value = craft_ocap.compute(captions=all_prompts, images=all_generated_images)
 
                 all_real_images = np.transpose(all_real_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
                 all_generated_images = np.transpose(all_generated_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
                 fid_score_value = compute_fid(all_real_images, all_generated_images, batch_size=args.clip_score_batch_size)  # doesn't support distirubted
 
-                clip_score_value = gather_object(clip_score_value)
-                fid_score_value = gather_object(fid_score_value)
+                clip_score_value = dist_utils.gather_object(clip_score_value)
+                fid_score_value = dist_utils.gather_object(fid_score_value)
 
                 if global_rank == 0:
-                    assert len(clip_score_value) == dist.get_world_size()
+                    assert len(clip_score_value) == dist_utils.get_world_size()
                     assert isinstance(clip_score_value[0], float), clip_score_value[0]
                     clip_score_value = np.mean(clip_score_value)
 
-                    assert len(fid_score_value) == dist.get_world_size()
+                    assert len(fid_score_value) == dist_utils.get_world_size()
                     assert isinstance(fid_score_value[0], float), fid_score_value[0]
                     fid_score_value = np.mean(fid_score_value)
 
@@ -621,7 +646,7 @@ if __name__ == "__main__":
                 logger.info(f"Saving model at step {global_step}")
                 meta = {
                     "global_step": global_step,
-                    "state_dict": model.module.state_dict(),
+                    "state_dict": unwrap_model(model).state_dict(),
                     "config": OmegaConf.to_container(config, resolve=True),
                 }
 

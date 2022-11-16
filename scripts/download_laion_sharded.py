@@ -40,8 +40,6 @@ def make_args():
 
 def main(args):
     # to prepare data: scripts/filter_laion.py
-
-    script_start_time = time.time()
     print(f"Loading dataset from {args.input_dir}")
     _time = time.time()
     dataset = load_from_disk(args.input_dir)
@@ -80,9 +78,12 @@ def main(args):
         shard_proc_mins = (time.time() - shard_start_time) / 60
         print(f"Shard {shard_idx} downloaded in {shard_proc_mins:.2f} mins")
 
-    print("Script finished successfully in", (time.time() - script_start_time) / 60, "mins")
-
 
 if __name__ == "__main__":
+    print("Starting script")
+    script_start_time = time.time()
+
     args = make_args()
     main(args)
+
+    print("Script finished successfully in", (time.time() - script_start_time) / 60, "mins")
