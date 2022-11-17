@@ -2,10 +2,10 @@
 python scripts/cache_text_features.py \
     --input_dir "/home/vlialin/data/text-laion-20M-images-with-text-train" \
     --start_shard 0 \
-    --num_shards 1 \
+    --num_shards 100 \
     --model_name "facebook/opt-6.7b" \
-    --batch_size 8 \
-    --dtype "int8" \
+    --batch_size 16 \
+    --dtype "bloat16" \
     --max_length 128 \
     --extract_layer -2 \
     --device 0
@@ -56,33 +56,36 @@ def parse_args():
 @torch.no_grad()
 def main(args):
     all_shards = sorted(glob(os.path.join(args.input_dir, "shard_*")))
+    if len(all_shards) > args.num_shards:
+        logger.warning(f"Found more shards than expected: {len(shards)} > {args.num_shards}")
+        logger.warning(f"Will process only {args.num_shards - args.start_shard} shards")
+        args.num_shards = len(shards) - args.start_shard
+
     shards = all_shards[args.start_shard:args.start_shard + args.num_shards]
 
     if len(shards) == 0:
         logger.error(f"No shards found in {args.input_dir=}")
         logger.error(f"Reminder that shards are expected to be in {args.input_dir}/shard_000000, {args.input_dir}/shard_000001, etc")
         exit(1)
-    
+
+    logger.info(f"Found {len(shards)} shards")
     logger.info(f"Starting with the shard {shards[0]}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    device_map = args.device
-    if isinstance(device_map, int):
-        device_map = {"": args.device}
-    logger.info(f"Using device map {device_map}")
 
     if args.dtype == "int8":
         logger.info("Loading model in int8 mode")
+        device_map = args.device
+        if isinstance(device_map, int):
+            device_map = {"": args.device}
+        logger.info(f"Using device map {device_map}")
+
         model = AutoModel.from_pretrained(args.model_name, load_in_8bit=True, device_map=device_map)
     else:
         logger.info(f"Loading model in {args.dtype} mode")
-        # model = AutoModel.from_pretrained(args.model_name).to(args.device, dtype=getattr(torch, args.dtype))
-        model = AutoModel.from_pretraine(args.model_name, device_map=device_map, dtype=getattr(torch, args.dtype))
+        model = AutoModel.from_pretrained(args.model_name).to(args.device, dtype=getattr(torch, args.dtype))
 
-    # trace the model
-    logger.info("Tracing the model")
     model.eval()
-    torch.jit.trace(model, torch.zeros(1, 1, dtype=torch.long).to(args.device)).to(args.device)
 
     if args.extract_layer < 0:
         _extract_layer = model.config.num_hidden_layers + args.extract_layer + 1
@@ -101,8 +104,13 @@ def main(args):
 
         for meta_path in tqdm(glob(os.path.join(shard_path, "*.json")), desc=shard_path):
             id_ = os.path.basename(meta_path).rstrip(".json")
-            meta = json.load(open(meta_path))
+            safetensors_file_path = os.path.join(save_dir, f"{id_}_{file_suffix}")
 
+            if os.path.exists(safetensors_file_path):
+                logger.error(f"File {file_path} already exists. Skipping")
+                continue
+
+            meta = json.load(open(meta_path))
             caption = meta["caption"]
             batch.append({"id": id_, "caption": caption})
 

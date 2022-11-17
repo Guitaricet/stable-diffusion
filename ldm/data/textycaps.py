@@ -8,6 +8,7 @@ import numpy as np
 import torch.utils.data
 from PIL import Image
 from datasets import Dataset as HFDataset
+from safetensors.torch import load_file
 
 from tqdm.auto import tqdm
 from loguru import logger
@@ -22,9 +23,13 @@ class TextyCaps(torch.utils.data.Dataset):
                  data_root,
                  size,
                  interpolation="bicubic",
+                 cached_text_features_suffix=None,
                  verbose=True,
                  ):
-        """Expected directory structure:
+        """A simple dataset for TextyCaps. It works with a big .arrow file that contains all the data (except for the images).
+        This can be quite slow to load, so we recommend to use ldm.data.webdataset when possible.
+
+        Expected directory structure:
 
         data_root/
             shard_000001/
@@ -41,6 +46,10 @@ class TextyCaps(torch.utils.data.Dataset):
         """
         logger.info(f"Loading TextyCaps dataset from {data_root}")
         self.data_root = data_root
+
+        self.cached_text_features_suffix = cached_text_features_suffix
+        if cached_text_features_suffix is not None:
+            logger.info(f"Loading cached text features from {cached_text_features_suffix}")
 
         hf_dataset_path = os.path.join(data_root, "dataset.arrow")
         if os.path.exists(hf_dataset_path):
@@ -100,6 +109,11 @@ class TextyCaps(torch.utils.data.Dataset):
 
         image = np.array(image).astype(np.uint8)
         example["image"] = (image / 127.5 - 1.0).astype(np.float32)
+
+        if self.cached_text_features_suffix is not None:
+            cached_text_features_path = image_path.replace(".jpg", f".{self.cached_text_features_suffix}")
+            example["text_features"] = load_file(cached_text_features_path)
+
         return example
 
     @staticmethod
