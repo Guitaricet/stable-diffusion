@@ -27,7 +27,7 @@ deepspeed main_nolightning.py \
 
 """
 
-import argparse, os, datetime, time
+import argparse, os, datetime, time, math
 from typing import Union
 
 from pprint import pformat
@@ -513,7 +513,7 @@ if __name__ == "__main__":
                 all_real_images = [] if global_rank == 0 else None
                 all_prompts = [] if global_rank == 0 else None
                 n_generated_images = 0
-                n_batches = images_to_log // batch_size
+                n_batches = math.ceil(images_to_log / batch_size)
 
                 logger.debug(f"Generating images (qualitative evaluation)")
                 for i, val_batch in tqdm(enumerate(val_loader), total=n_batches, desc="Generating image grids"):
@@ -523,7 +523,7 @@ if __name__ == "__main__":
                     prompts = val_batch[model.cond_stage_key]
                     prompts_gathered = dist_utils.gather_object(prompts)
                     if global_rank == 0:
-                        all_prompts.extend(prompts)
+                        all_prompts.extend(prompts_gathered)
 
                     # TODO: move logging real imges to before the loop
                     if not logged_real_images:
