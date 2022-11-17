@@ -278,9 +278,13 @@ def get_dataloader(dataset_config, num_workers, batch_size, shuffle, is_webdatas
     return loader
 
 
-if __name__ == "__main__":
-    DEVICE = "cuda"
+def is_gradient_accumulation_boundary(model, step_idx, gradient_accumulation_steps):
+    if isinstance(model, deepspeed.DeepSpeedEngine):
+        return model.is_gradient_accumulation_boundary()
+    return step_idx % gradient_accumulation_steps == 0
 
+
+if __name__ == "__main__":
     args = parse_args()
     if "LOCAL_RANK" in os.environ:
         # support torchrun
@@ -291,8 +295,14 @@ if __name__ == "__main__":
 
     global_rank = dist_utils.get_rank()
     local_rank = dist_utils.get_rank() % torch.cuda.device_count()
+    device = f"cuda:{local_rank}"
 
-    if global_rank != 0:
+    if "LOCAL_RANK" in os.environ:
+        assert local_rank == int(os.environ["LOCAL_RANK"])
+
+    if global_rank == 0:
+        logger.level
+    else:
         logger.remove()
 
     logger.info(f"Starting run with args: {pformat(vars(args))}")
@@ -311,6 +321,7 @@ if __name__ == "__main__":
     config = OmegaConf.merge(*configs)
 
     if "lightning" in config:
+        logger.warning("Found lightning config, ignoring it")
         config.pop("lightning")
 
     # OmegaConf to dict
@@ -362,19 +373,18 @@ if __name__ == "__main__":
             optimizer=optimizer,
             config=deepspeed_config,
         )
-
     model: Union[LatentDiffusion, deepspeed.DeepSpeedEngine]  # helps with type hinting
 
     dtype = get_dtype(model, config)
 
     if not args.distributed:
         # deepspeed handles device placement for us
-        model = model.to(DEVICE, dtype=dtype)
+        model = model.to(device, dtype=dtype)
 
     # convert model inputs to dtype
     model.set_data_dtype(dtype)
-    clip_score = CLIPScore(device=DEVICE, dtype=dtype, distributed=False)  # compute them independently on different GPUs, then gather and average
-    craft_ocap = CraftOCap(use_gpu=torch.cuda.is_available())
+    clip_score = CLIPScore(device=device, dtype=dtype, distributed=False)  # compute them independently on different GPUs, then gather and average
+    craft_ocap = CraftOCap(device="cpu")  # cuda is fundamenally broken in easyocr, because it has DataParallel hard-coded
 
     if global_rank == 0:
         config_dict = OmegaConf.to_container(config, resolve=True)
@@ -413,7 +423,7 @@ if __name__ == "__main__":
     if val_diffusion_steps < 50:
         logger.warning(f"Using a small number of diffusion steps for evaluation: {val_diffusion_steps}")
 
-    val_start_code = torch.randn([batch_size, 4, 512 // 8, 512 // 8], dtype=dtype, device=DEVICE)
+    val_start_code = torch.randn([batch_size, 4, 512 // 8, 512 // 8], dtype=dtype, device=device)
     val_sampler = PLMSSampler(unwrap_model(model)) if args.pmls else DDIMSampler(unwrap_model(model))
     val_guidance_scale = 7.5
     val_eta = 0.0  # has to be zero for PMLS
@@ -435,6 +445,7 @@ if __name__ == "__main__":
     logged_real_images = False
     start_time = time.time()
     images_to_log = 12
+    grad_acc = config.deepspeed.gradient_accumulation_steps
 
     for epoch in range(args.max_epochs):
         logger.info(f"Starting epoch {epoch + 1} / {args.max_epochs}")
@@ -470,9 +481,6 @@ if __name__ == "__main__":
             else:
                 loss.backward()
 
-            if model.cond_stage_model.adapter[0].weight.grad is not None:
-                print(f"Rank {global_rank} has grad for adapter")
-
             if isinstance(model, deepspeed.DeepSpeedEngine):
                 model.step()
             else:
@@ -480,11 +488,11 @@ if __name__ == "__main__":
 
             examples_seen += batch_size * dist_utils.get_world_size()
 
-            if model.is_gradient_accumulation_boundary():
-                # it's important that this one is separate from the next if
+            if is_gradient_accumulation_boundary(model, global_step, grad_acc):
+                # it's important that this statement is separate from the next if
                 update_step += 1
 
-            if wandb.run is not None and model.is_gradient_accumulation_boundary():
+            if wandb.run is not None and is_gradient_accumulation_boundary(model, global_step, grad_acc):
                 examples_per_second = examples_seen / (time.time() - start_time)
                 wandb.log({
                     "loss": loss,
@@ -505,8 +513,10 @@ if __name__ == "__main__":
                 all_real_images = [] if global_rank == 0 else None
                 all_prompts = [] if global_rank == 0 else None
                 n_generated_images = 0
+                n_batches = images_to_log // batch_size
 
-                for i, val_batch in enumerate(val_loader):
+                logger.debug(f"Generating images (qualitative evaluation)")
+                for i, val_batch in tqdm(enumerate(val_loader), total=n_batches, desc="Generating image grids"):
                     if n_generated_images >= images_to_log:
                         break
 
@@ -518,7 +528,7 @@ if __name__ == "__main__":
                     # TODO: move logging real imges to before the loop
                     if not logged_real_images:
                         images = val_batch[model.first_stage_key]
-                        images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
+                        images = rearrange(images, "b h w c -> b c h w").to(device)
 
                         images_gathered = dist_utils.gather_tensor(images)
                         if global_rank == 0:
@@ -548,6 +558,7 @@ if __name__ == "__main__":
 
                 # end of inference
                 if global_rank == 0:
+                    logger.debug(f"Logging images to wandb")
                     images_to_log = batch_size * dist_utils.get_world_size()
                     all_generated_images = np.concatenate(all_generated_images, axis=0)
                     log_generated_images = all_generated_images[:images_to_log]
@@ -569,6 +580,7 @@ if __name__ == "__main__":
                 all_prompts = []
 
                 n_val_batches = min(args.validation_batches, len(val_loader))
+                logger.debug(f"Generating images (quantitative evaluation)")
                 _desc = f"Validation at step {global_step}, generating images for CLIP and FID scores"
                 with model.ema_scope():
                     for i, val_batch in enumerate(tqdm(val_loader, total=n_val_batches, desc=_desc, disable=global_rank != 0)):
@@ -577,7 +589,7 @@ if __name__ == "__main__":
                         all_prompts.extend(prompts)
 
                         images = val_batch[model.first_stage_key]
-                        images = rearrange(images, "b h w c -> b c h w").to(DEVICE)
+                        images = rearrange(images, "b h w c -> b c h w").to(device)
                         images = postprocess_image(images)
                         all_real_images.extend(images)
 
@@ -598,10 +610,16 @@ if __name__ == "__main__":
                         )
                         assert generated_images.shape == (batch_size, 512, 512, 3), generated_images.shape
                         all_generated_images.append(generated_images)
+                logger.debug(f"Done generating images (quantitative evaluation)")
 
                 assert len(all_generated_images) == n_val_batches
                 assert all_generated_images[0].shape == (batch_size, 512, 512, 3)
                 all_generated_images = np.concatenate(all_generated_images, axis=0)
+
+                logger.info("Computing OCAP scores")
+                _ocap_time = time.time()
+                ocap_score_value = craft_ocap.compute(captions=all_prompts, images=all_generated_images)
+                logger.info(f"Done computing OCAP scores, took {time.time() - _ocap_time:.2f} seconds")
 
                 logger.info("Computing CLIP scores")
                 clip_score_value = clip_score.compute(captions=all_prompts, images=all_generated_images, batch_size=args.clip_score_batch_size)
@@ -610,10 +628,6 @@ if __name__ == "__main__":
                 assert len(all_real_images) == len(all_generated_images)
                 assert len(all_real_images) == batch_size * n_val_batches
                 assert all_real_images[0].shape == (512, 512, 3), all_real_images[0].shape
-
-                logger.info("Computing OCAP scores")
-                with torch.cuda(device=local_rank):
-                    ocap_score_value = craft_ocap.compute(captions=all_prompts, images=all_generated_images)
 
                 all_real_images = np.transpose(all_real_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]
                 all_generated_images = np.transpose(all_generated_images, (0, 3, 1, 2))  # [batch_size, channels, height, width]

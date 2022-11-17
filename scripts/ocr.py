@@ -156,6 +156,14 @@ def process_shard(shard_dir, shard_output_dir):
                 os.remove(txt_meta_path)
 
             total_images_processed += 1
+    
+    shards = glob(os.path.join(shard_output_dir, "*"))
+    total_images = 0
+    for shard in shards:
+        if os.path.isdir(shard):
+            total_images += len(glob(os.path.join(shard, "*.jpg")))
+        else:
+            total_images += 1
 
     minutes = (time.time() - _shard_start_time) / 60
     images_per_second = num_subfolder_images / (minutes * 60)
@@ -163,6 +171,7 @@ def process_shard(shard_dir, shard_output_dir):
     logger.info(f"Images per second: {images_per_second:.2f}")
     logger.info(f"Found {n_images_with_ocr} images with text in total")
     logger.warning(f"Skipped {no_meta_count} images without .json file")
+    logger.info(f"Total images produced in shard: {total_images}")
     return n_images_with_ocr
 
 

@@ -13,11 +13,11 @@ class CraftOCap:
         "confidence_threshold": 0.5,
     }
 
-    def __init__(self, use_gpu=None):
-        if use_gpu is None:
-            use_gpu = torch.cuda.is_available()
+    def __init__(self, device=None):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.ocr = easyocr.Reader(["en"], detect_network='craft', gpu=use_gpu)
+        self.ocr = easyocr.Reader(["en"], detect_network='craft', gpu=device)
         self.chrf = evaluate.load("chrf")
     
     @property

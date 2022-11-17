@@ -93,9 +93,10 @@ class DDPM(pl.LightningModule):
         self.loss_type = loss_type
 
         self.learn_logvar = learn_logvar
-        self.logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
-        if self.learn_logvar:
-            self.logvar = nn.Parameter(self.logvar, requires_grad=True)
+        # NOTE: we changed how logvar behaves, it is always a parameter now, even if it doesn't require grad
+        # this simplifies device placement
+        logvar = torch.full(fill_value=logvar_init, size=(self.num_timesteps,))
+        self.logvar = nn.Parameter(logvar, requires_grad=bool(self.learn_logvar))
 
     def set_data_dtype(self, dtype):
         self.data_dtype = dtype
