@@ -17,7 +17,6 @@ deepspeed main_nolightning.py \
     --conditioning_drop 0.1 \
     --wait_on_rank_when_loading_model 220 \
 
-
 deepspeed main_nolightning.py \
     --base configs/stable-diffusion/webdataset-finetune-textycaps-opt6b-lora.yaml \
     --actual_resume checkpoints/stable-diffusion-v-1-4-original/sd-v1-4.ckpt \
@@ -25,9 +24,17 @@ deepspeed main_nolightning.py \
     --eval_every 10 \
     --train_only_adapters \
 
+deepspeed main_nolightning.py \
+    --base configs/webdataset-finetune-textycaps-opt6b-lora.yaml \
+    --actual_resume checkpoints/stable-diffusion-v-1-4-original/sd-v1-4.ckpt \
+    --max_epochs 2 \
+    --eval_every 10000 \
+    --eval_diffusion_steps 50 \
+    --save_every 10000 \
+    --train_only_adapters
 """
 
-import argparse, os, datetime, time, math
+import argparse, os, datetime, time, math, random
 from typing import Union
 
 from pprint import pformat
@@ -249,19 +256,24 @@ def get_update2param_ratio(model, lr, trainable_parameters_names):
     return ratios_dict
 
 
-def get_dataloader(dataset_config, num_workers, batch_size, shuffle, is_webdataset=False):
-    if is_webdataset:
-        if dataset_config.params.batch_size != batch_size:
-            raise ValueError("batch_size in dataset config must be equal to batch_size in dataloader config")
-        if shuffle != dataset_config.params.shuffle:
-            raise ValueError("shuffle in dataset config must be equal to shuffle in dataloader config")
-
+def get_dataloader(dataset_config, num_workers, batch_size, shuffle):
     sampler = None
     dataset = instantiate_from_config(dataset_config)
+
     if isinstance(dataset, TextyCapsWebdataset):
         logger.info("Using Webdataset")
         dataset = dataset.get_dataset()
+
+        if dataset_config.params.batch_size != batch_size:
+            raise ValueError(
+                f"batch_size in dataset config ({dataset_config.params.batch_size}) is not equal to the one in the config ({batch_size})"
+            )
+        if shuffle != dataset_config.params.shuffle:
+            raise ValueError(
+                f"shuffle in dataset config ({dataset_config.params.shuffle}) is not equal to the one in the config ({shuffle})"
+            )
         batch_size = None
+
     elif dist_utils.is_distributed():
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset,
@@ -384,7 +396,7 @@ if __name__ == "__main__":
     # convert model inputs to dtype
     model.set_data_dtype(dtype)
     clip_score = CLIPScore(device=device, dtype=dtype, distributed=False)  # compute them independently on different GPUs, then gather and average
-    craft_ocap = CraftOCap(device="cpu")  # cuda is fundamenally broken in easyocr, because it has DataParallel hard-coded
+    craft_ocap = CraftOCap(device=device)
 
     if global_rank == 0:
         config_dict = OmegaConf.to_container(config, resolve=True)
@@ -397,12 +409,11 @@ if __name__ == "__main__":
         for config_path in args.base:
             wandb.save(config_path, policy="now")
 
-    train_dataset = instantiate_from_config(config.data.params.train)
-    val_dataset = instantiate_from_config(config.data.params.val)
-
     if args.distributed:
         # more flexible when using DeepSpeed as we can configure train_batch_size (total batch size) instead
         batch_size = int(model.config["train_micro_batch_size_per_gpu"])
+        if batch_size is None:
+            batch_size = config.deepspeed.train_micro_batch_size_per_gpu
     else:
         batch_size = config.deepspeed.train_micro_batch_size_per_gpu
 
@@ -512,12 +523,11 @@ if __name__ == "__main__":
                 all_generated_images = [] if global_rank == 0 else None
                 all_real_images = [] if global_rank == 0 else None
                 all_prompts = [] if global_rank == 0 else None
-                n_generated_images = 0
                 n_batches = math.ceil(images_to_log / batch_size)
 
                 logger.debug(f"Generating images (qualitative evaluation)")
                 for i, val_batch in tqdm(enumerate(val_loader), total=n_batches, desc="Generating image grids"):
-                    if n_generated_images >= images_to_log:
+                    if i >= n_batches:
                         break
 
                     prompts = val_batch[model.cond_stage_key]
@@ -548,7 +558,6 @@ if __name__ == "__main__":
                             eta=val_eta,
                             start_code=val_start_code,
                         )
-                        n_generated_images += dist_utils.get_world_size()
 
                         if global_rank == 0:
                             assert generated_images.shape[0] == batch_size * dist_utils.get_world_size(), generated_images.shape
@@ -561,14 +570,15 @@ if __name__ == "__main__":
                     logger.debug(f"Logging images to wandb")
                     images_to_log = batch_size * dist_utils.get_world_size()
                     all_generated_images = np.concatenate(all_generated_images, axis=0)
-                    log_generated_images = all_generated_images[:images_to_log]
-                    log_prompts = all_prompts[:images_to_log]
+                    logger.debug(f"all_generated_images.shape: {all_generated_images.shape}")
+                    log_generated_images = all_generated_images
+                    log_prompts = all_prompts
 
                     images_log = [wandb.Image(im, caption=p) for im, p in zip(log_generated_images, log_prompts)]
                     wandb.log({"val/generated_images_row": images_log}, step=global_step)
 
                     if not logged_real_images:
-                        log_real_images = all_real_images[:images_to_log]
+                        log_real_images = all_real_images
                         images_log = [wandb.Image(im, caption=p) for im, p in zip(log_real_images, log_prompts)]
                         wandb.log({"val/real_images": images_log}, step=global_step)
 
@@ -579,7 +589,7 @@ if __name__ == "__main__":
                 all_real_images = []
                 all_prompts = []
 
-                n_val_batches = min(args.validation_batches, len(val_loader))
+                n_val_batches = args.validation_batches  # we can't use len(val_loader) here if we use webdataset
                 logger.debug(f"Generating images (quantitative evaluation)")
                 _desc = f"Validation at step {global_step}, generating images for CLIP and FID scores"
                 with model.ema_scope():
@@ -593,10 +603,12 @@ if __name__ == "__main__":
                         images = postprocess_image(images)
                         all_real_images.extend(images)
 
-                        # returns [batch_size, 512, 512, 3] numpy array
-                        if i < len(val_loader):  # last batch might be truncated
-                            assert len(prompts) == batch_size, (len(prompts), batch_size)
+                        if len(prompts) != batch_size:
+                            logger.warning(f"Expected batch size {batch_size}, got {len(prompts)}")
+                            logger.warning(f"This might be alright for the last batch, but not for the others")
+                            logger.warning(f"Current batch index {i}, total batches {n_val_batches}")
 
+                        # returns [batch_size, 512, 512, 3] numpy array
                         generated_images = generate_images(
                             sampler=val_sampler,
                             model=model,
@@ -612,7 +624,9 @@ if __name__ == "__main__":
                         all_generated_images.append(generated_images)
                 logger.debug(f"Done generating images (quantitative evaluation)")
 
-                assert len(all_generated_images) == n_val_batches
+                if len(all_generated_images) != n_val_batches:
+                    raise ValueError(f"Rank {global_rank}: Expected {n_val_batches} batches, got {len(all_generated_images)}")
+
                 assert all_generated_images[0].shape == (batch_size, 512, 512, 3)
                 all_generated_images = np.concatenate(all_generated_images, axis=0)
 

@@ -40,6 +40,7 @@ def main(args):
     script_start_time = time.time()
 
     total_images_with_ocr = 0
+    processed_shard_names = []
     for shard_id in range(args.start_shard, args.start_shard + args.num_shards):
         shard_start_time = time.time()
         input_dir = os.path.join(args.input_dir, f"shard_{shard_id:06d}")
@@ -48,6 +49,7 @@ def main(args):
         logger.info(f"Processing shard {shard_id} in directory {input_dir}")
         shard_images_with_ocr = process_shard(input_dir, output_dir)
         total_images_with_ocr += shard_images_with_ocr
+        processed_shard_names.append(f"shard_{shard_id:06d}")
 
         hours = (time.time() - shard_start_time) / 3600
         logger.info(f"Processed shard {shard_id} in {hours:.2f} hours")
@@ -56,6 +58,7 @@ def main(args):
     hours = (time.time() - script_start_time) / 3600
     logger.info(f"Processed all shards in {hours:.2f} hours")
     logger.info(f"Found {total_images_with_ocr} images with text in total")
+    logger.info(f"Processed shards: {processed_shard_names}")
 
 
 def format_result(ocr_result):
@@ -112,8 +115,7 @@ def process_shard(shard_dir, shard_output_dir):
             if caption is None or caption == "": # happens a few times in the dataset
                 os.remove(image_path)
                 os.remove(image_meta_path)
-                if os.path.exists(txt_meta_path):
-                    os.remove(txt_meta_path)
+                os.remove(txt_meta_path)
                 continue
 
             caption = caption.lower()
@@ -152,8 +154,7 @@ def process_shard(shard_dir, shard_output_dir):
 
             if os.path.exists(image_path): os.remove(image_path)
             os.remove(image_meta_path)
-            if os.path.exists(txt_meta_path):
-                os.remove(txt_meta_path)
+            os.remove(txt_meta_path)
 
             total_images_processed += 1
     

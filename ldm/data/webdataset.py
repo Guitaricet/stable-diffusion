@@ -15,7 +15,7 @@ class TextyCapsWebdataset:
         batch_size: batch size, Webdataset does batching internally and when wrapping it in a dataloader
             you need to set batch_size=None
     """
-    def __init__(self, url, image_size, batch_size, interpolation="bicubic", shuffle=False) -> None:
+    def __init__(self, url, image_size, batch_size, interpolation="bicubic", shuffle=True) -> None:
         self.url = f'pipe:curl -L -s {url} || true'
         self.size = image_size
         self.batch_size = batch_size
@@ -39,7 +39,7 @@ class TextyCapsWebdataset:
 
     def collate_fn(self, batch):
         images, captions = default_collate(batch)
-        return {"images": images, "captions": captions}
+        return {"image": images, "captions": captions}
 
     def get_dataset(self):
         return self.dataset
