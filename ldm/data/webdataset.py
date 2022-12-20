@@ -39,7 +39,7 @@ class TextyCapsWebdataset:
 
     def collate_fn(self, batch):
         images, captions = default_collate(batch)
-        return {"image": images, "captions": captions}
+        return {"image": images, "caption": captions}
 
     def get_dataset(self):
         return self.dataset
