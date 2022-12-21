@@ -28,8 +28,8 @@ deepspeed main_nolightning.py \
     --base configs/webdataset-finetune-textycaps-opt6b-lora.yaml \
     --actual_resume checkpoints/stable-diffusion-v-1-4-original/sd-v1-4.ckpt \
     --max_epochs 2 \
-    --eval_every 10000 \
-    --eval_diffusion_steps 50 \
+    --eval_every 10 \
+    --eval_diffusion_steps 5 \
     --save_every 10000 \
     --train_only_adapters
 """
@@ -111,6 +111,7 @@ def parse_args(**parser_kwargs):
     parser.add_argument("--project", type=str, default="stable_diffusion_text", help="wandb project name")
     parser.add_argument("--wait_on_rank_when_loading_model", type=int, default=None, help="Wait this many seconds on each rank when loading model. Reduces peak CPU memory usage.")
     parser.add_argument("--distributed", default=True, type=str2bool, nargs="?", const=True)
+    parser.add_argument("--do_not_eval_on_first_step", action="store_true", default=False, help="Do not evaluate on first step. Useful for debug.")
     args = parser.parse_args()
     return args
 
@@ -519,6 +520,10 @@ if __name__ == "__main__":
             # --- Validation starts
             _validation_time = time.time()
             if global_step % eval_every == 0:
+                if global_step <= 1 and args.do_not_eval_on_first_step:
+                    logger.info("Skipping validation on first step")
+                    continue
+
                 logger.info(f"Starting validation at step {global_step}")
                 all_generated_images = [] if global_rank == 0 else None
                 all_real_images = [] if global_rank == 0 else None

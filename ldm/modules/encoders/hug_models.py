@@ -88,7 +88,8 @@ class FrozenHugEmbedderWithAdapter(nn.Module):
             if "LOCAL_RANK" in os.environ:
                 assert int(os.environ["LOCAL_RANK"]) == gpu_index
 
-            logger.info(f"Using 8-bit model. Rank: {gpu_index}")
+            if model_kwargs["load_in_8bit"]:
+                logger.info(f"Using 8-bit model. Rank: {gpu_index}")
 
             device_map = {'': int(gpu_index)}  # put everything on the same device
             if "device_map" in model_kwargs:
