@@ -219,9 +219,7 @@ def process_shard(shard_dir, shard_output_dir):
             total_images += 1
 
     minutes = (time.time() - _shard_start_time) / 60
-    images_per_second = num_subfolder_images / (minutes * 60)
     logger.info(f"Processed {len(all_subfolders)} subfolders in {minutes:.2f} minutes")
-    logger.info(f"Images per second: {images_per_second:.2f}")
     logger.info(f"Found {n_images_with_ocr} images with text in total")
     logger.warning(f"Skipped {no_meta_count} images without .json file")
     logger.info(f"Total images produced in shard: {total_images}")
