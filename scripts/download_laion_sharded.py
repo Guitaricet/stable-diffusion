@@ -13,9 +13,9 @@ python scripts/download_laion_sharded.py \
     --input_dir "/home/vlialin/data/laion-filtered" \
     --output_dir "/home/vlialin/data/texty-caps" \
     --shard_size 100000 \
-    --start_shard 0 \
-    --num_shards 1000 \
-    --num_processes 6 \
+    --start_shard 224 \
+    --num_shards 100 \
+    --num_processes 2 \
 """
 
 import argparse

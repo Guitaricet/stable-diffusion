@@ -1,15 +1,27 @@
 """Perform OCR on images, check if ocr'ed text is close to caption, if no delete image if yes move to the dataset folder
 
-sleep 1800 && python scripts/ocr.py \
-    --input_dir "/home/vlialin/data/text-laion-20M-images" \
-    --output_dir "/home/vlialin/data/text-laion-20M-images-with-text" \
-    --start_shard 21 \
-    --num_shards 78
+export CUDA_VISIBLE_DEVICES=0  # the script will use all available GPUs in an inefficient way, so we limit it to one
+python scripts/ocr.py \
+    --input_dir "/home/vlialin/data/texty-caps" \
+    --output_dir "/home/vlialin/data/texty-caps-ocred" \
+    --start_shard 166 \
+    --process_every 2 \
+    --num_shards 50
+
+export CUDA_VISIBLE_DEVICES=1  # the script will use all available GPUs in an inefficient way, so we limit it to one
+python scripts/ocr.py \
+    --input_dir "/home/vlialin/data/texty-caps" \
+    --output_dir "/home/vlialin/data/texty-caps-ocred" \
+    --start_shard 167 \
+    --process_every 2 \
+    --num_shards 50
+
 """
 import argparse
 import time
 import os
 import json
+import subprocess
 from glob import glob
 
 import numpy as np
@@ -18,6 +30,9 @@ import evaluate
 import easyocr
 from tqdm.auto import tqdm
 from loguru import logger
+
+from .common import cleanup_webdataset_directory
+
 
 reader = easyocr.Reader(["en"], detect_network='craft', gpu=True)
 chrf = evaluate.load("chrf")
@@ -29,7 +44,10 @@ def make_args():
     parser.add_argument("--output_dir", help="path to directory where to save images", required=True)
 
     parser.add_argument("--start_shard", required=True, type=int)
+    parser.add_argument("--process_every", default=1, type=int)
     parser.add_argument("--num_shards", required=True, type=int)
+
+    parser.add_argument("--gcp_bucket_name", default=None, type=str)
 
     return parser.parse_args()
 
@@ -41,19 +59,53 @@ def main(args):
 
     total_images_with_ocr = 0
     processed_shard_names = []
-    for shard_id in range(args.start_shard, args.start_shard + args.num_shards):
-        shard_start_time = time.time()
-        input_dir = os.path.join(args.input_dir, f"shard_{shard_id:06d}")
-        output_dir = os.path.join(args.output_dir, f"shard_{shard_id:06d}")
+    for shard_id in range(args.start_shard, args.start_shard + args.num_shards, args.process_every):
+        shard_name = f"shard_{shard_id:06d}"
 
-        logger.info(f"Processing shard {shard_id} in directory {input_dir}")
+        shard_start_time = time.time()
+        input_dir = os.path.join(args.input_dir, shard_name)
+        output_dir = os.path.join(args.output_dir, shard_name)
+
+        logger.info(f"Processing shard {shard_name} in directory {input_dir}")
+
+        if not os.path.exists(input_dir):
+            raise ValueError(f"Input directory {input_dir} does not exist")
+
         shard_images_with_ocr = process_shard(input_dir, output_dir)
+
+        # delete any files that don't have a matching pair
+        # this might happen if you ran script over the same directory twice
+        cleanup_webdataset_directory(shard_images_with_ocr)
+
+        if args.gcp_bucket_name is not None:
+            # tar and upload to GCP bucket asychronously
+            tar_command = f"tar -cf {output_dir}.tar {output_dir}"
+            upload_command = f"gsutil cp {output_dir}.tar gs://{args.gcp_bucket_name}/{shard_name}.tar"
+            delete_directory_command = f"rm -rf {output_dir}"
+            delete_tar_command = f"rm -rf {output_dir}.tar"
+            # do not run the next command if the previous one failed
+            # echo between all commands
+            full_command = f"""
+            {tar_command} && \
+                echo "Tarred directory {output_dir}" && \
+                {upload_command} && \
+                echo "Uploaded tar to GCP bucket" && \
+                {delete_directory_command} && \
+                echo "Deleted directory {output_dir}" && \
+                {delete_tar_command} && \
+                echo "Deleted tar {output_dir}.tar" && \
+                echo "Finished tar-upload process for shard {shard_name}"
+            """
+            output = subprocess.run(full_command, shell=True)
+            if output[0].split()[-1] != "Successfully":
+                raise RuntimeError("Upload failed: " + output)
+
         total_images_with_ocr += shard_images_with_ocr
-        processed_shard_names.append(f"shard_{shard_id:06d}")
+        processed_shard_names.append(shard_name)
 
         hours = (time.time() - shard_start_time) / 3600
-        logger.info(f"Processed shard {shard_id} in {hours:.2f} hours")
-        logger.info(f"Found {shard_images_with_ocr} images with text in shard {shard_id}")
+        logger.info(f"Processed shard {shard_name} in {hours:.2f} hours")
+        logger.info(f"Found {shard_images_with_ocr} images with text in shard {shard_name}")
     
     hours = (time.time() - script_start_time) / 3600
     logger.info(f"Processed all shards in {hours:.2f} hours")
