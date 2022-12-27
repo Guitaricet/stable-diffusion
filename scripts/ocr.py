@@ -31,7 +31,7 @@ import easyocr
 from tqdm.auto import tqdm
 from loguru import logger
 
-from .common import cleanup_webdataset_directory
+from ldm.texty_caps_utils import cleanup_webdataset_directory
 
 
 reader = easyocr.Reader(["en"], detect_network='craft', gpu=True)
