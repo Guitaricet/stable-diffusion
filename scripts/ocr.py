@@ -75,11 +75,11 @@ def main(args):
 
         # delete any files that don't have a matching pair
         # this might happen if you ran script over the same directory twice
-        cleanup_webdataset_directory(shard_images_with_ocr)
+        cleanup_webdataset_directory(output_dir)
 
         if args.gcp_bucket_name is not None:
             # tar and upload to GCP bucket asychronously
-            tar_command = f"tar -cf {output_dir}.tar {output_dir}"
+            tar_command = f"tar --sort=name -cf {output_dir}.tar {output_dir}"
             upload_command = f"gsutil cp {output_dir}.tar gs://{args.gcp_bucket_name}/{shard_name}.tar"
             delete_directory_command = f"rm -rf {output_dir}"
             delete_tar_command = f"rm -rf {output_dir}.tar"
