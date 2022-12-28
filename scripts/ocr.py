@@ -79,10 +79,14 @@ def main(args):
 
         if args.gcp_bucket_name is not None:
             # tar and upload to GCP bucket asychronously
-            tar_command = f"tar --sort=name -cf {output_dir}.tar {output_dir}"
+            output_dir_base_name = os.path.basename(output_dir)
+
+            # e.g., tar --sort=name -cf output_dir.tar -C output_dir output_dir_base_name
+            tar_command = f"tar --sort=name -cf {output_dir}.tar -C {output_dir} {output_dir_base_name}"
             upload_command = f"gsutil cp {output_dir}.tar gs://{args.gcp_bucket_name}/{shard_name}.tar"
             delete_directory_command = f"rm -rf {output_dir}"
             delete_tar_command = f"rm -rf {output_dir}.tar"
+
             # do not run the next command if the previous one failed
             # echo between all commands
             full_command = f"""
@@ -133,7 +137,6 @@ def process_shard(shard_dir, shard_output_dir):
     all_subfolders = sorted(glob(os.path.join(shard_dir, "*")))
 
     pbar = tqdm(all_subfolders)
-    num_subfolder_images = 0
     for subfolder in pbar:
         # check if subfolder is actualy a folder
         if not os.path.isdir(subfolder):
@@ -144,7 +147,6 @@ def process_shard(shard_dir, shard_output_dir):
             pbar.set_description(f"Processed {total_images_processed} images, {images_per_second:.2f} images/s")
 
         subfolder_images_with_ocr = 0
-        num_subfolder_images = len(glob(os.path.join(subfolder, "*.jpg")))
         for image_path in glob(f"{subfolder}/*.jpg"):
             image_save_path = os.path.join(shard_output_dir, os.path.basename(image_path))
             if os.path.exists(image_save_path):
